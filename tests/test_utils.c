@@ -1,0 +1,2189 @@
+#include "../dishen/jsonlite.h"
+#include "../dishen/b64.h"
+#include "../dishen/sfo.h"
+#include "../dishen/tmdb_crypto.h"
+#include "../dishen/updater.h"
+#include "../dishen/art.h"
+#include "../dishen/health.h"
+#include "../dishen/clock.h"
+#include "../dishen/cfg.h"
+#include "../dishen/appdb.h"
+#include "../dishen/discord.h"
+#include "../dishen/timesync.h"
+#include "../dishen/daemon.h"
+#include "../dishen/supervise.h"
+#include "../dishen/detect.h"
+#include "../dishen/procwalk.h"
+#include "../dishen/bigapp.h"
+#include "../dishen/retro.h"
+#include "../dishen/custom.h"
+#include "../dishen/pkgzone.h"
+#include "../dishen/gamecache.h"
+#include "../dishen/fw.h"
+#include "../dishen/localmeta.h"
+#include "../dishen/cloudinary.h"
+#include "../dishen/ws.h"
+#include "../dishen/gamecache.h"
+#include "../dishen/pkgzone.h"
+#include "../installer/icfg.h"
+#include "sqlite3.h"
+#include <string.h>
+
+/* discord.c host stubs: builder tests never touch the wire. */
+int detect_media_type(const char *t){
+    if(t && !strcmp(t, "CUSA00127")) return 3;
+    return 0;
+}
+int ws_connect(ws_t *w, const char *h, int p, const char *r, const char *k){
+    (void)w; (void)h; (void)p; (void)r; (void)k; return -1;
+}
+int ws_send_text(ws_t *w, const char *m, size_t n){
+    extern int test_ws_send_ok, test_ws_send_calls;
+    (void)w; (void)m; test_ws_send_calls++;
+    return test_ws_send_ok ? (int)n : -1;
+}
+int ws_recv_frame(ws_t *w, char *b, size_t c, int *o, int *f){
+    extern int test_ws_recv_idle;
+    (void)w; (void)b; (void)c; (void)o; (void)f;
+    return test_ws_recv_idle ? 0 : -1;
+}
+int ws_pong(ws_t *w, const unsigned char *payload, size_t len){
+    (void)w; (void)payload; (void)len; return -1;
+}
+int ws_close(ws_t *w){ (void)w; return -1; }
+/* ws.c itself is not linked on the host (it owns a tls_ctx_t), so the pure
+ * drain arithmetic comes in directly. Only ws_skip_plan is needed, and it is
+ * real code compiled from the real source, not a copy. */
+#include "../dishen/ws_skip.c"
+#include "../dishen/ws_env.c"
+#include "../dishen/ws_frame.c"
+#include <mbedtls/ecdsa.h>
+#include <mbedtls/ecp.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/sha256.h>
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+int test_ws_send_ok = 0, test_ws_send_calls = 0, test_ws_recv_idle = 0;
+
+/* Portable temp dir (mkdtemp needs feature macros this toolchain lacks). */
+static int make_tmpdir(char *out, size_t cap){
+    static int seq = 0;
+    snprintf(out, cap, "/tmp/orx_test_%d_%d", (int)getpid(), seq++);
+    if(mkdir(out, 0700) != 0) return -1;
+    return 0;
+}
+
+static void test_json(void) {
+    const char input[] = "{\"name\":\"A\\u00e9\",\"items\":[true,2,null]}";
+    jl_val_t *root = jl_parse(input, sizeof(input) - 1);
+    assert(root && root->type == JL_OBJECT);
+    assert(strcmp(jl_obj_get(root, "name")->str, "A\xc3\xa9") == 0);
+    assert(jl_arr_at(jl_obj_get(root, "items"), 0)->num == 1);
+    assert(jl_arr_at(jl_obj_get(root, "items"), 1)->num == 2);
+    assert(jl_arr_at(jl_obj_get(root, "items"), 2)->type == JL_NULL);
+    jl_free(root);
+
+    assert(jl_parse("{} trailing", 11) == NULL);
+    assert(jl_parse("[1,]", 4) == NULL);
+    assert(jl_parse("\"unterminated", 13) == NULL);
+}
+
+static void test_gateway_op_spoof(void) {
+    /* string value containing `"op":` must not spoof the real op */
+    const char input[] = "{\"note\":\"x \\\"op\\\":99 y\",\"op\":10,\"s\":42}";
+    jl_val_t *r = jl_parse(input, sizeof(input)-1);
+    assert(r && r->type == JL_OBJECT);
+    const jl_val_t *op = jl_obj_get(r, "op");
+    const jl_val_t *s = jl_obj_get(r, "s");
+    assert(op && op->type == JL_NUMBER && (int)op->num == 10);
+    assert(s && s->type == JL_NUMBER && (int)s->num == 42);
+    jl_free(r);
+    /* missing op -> NULL, not crash */
+    const char no_op[] = "{\"t\":\"READY\"}";
+    jl_val_t *r2 = jl_parse(no_op, sizeof(no_op)-1);
+    assert(r2 && jl_obj_get(r2, "op") == NULL);
+    jl_free(r2);
+}
+
+/* --- oversized-frame drain arithmetic ---------------------------------
+ * A real account's READY measured 11.7 MB (four attempts, 11695449 /
+ * 11694320 / 11694256 / 11706895), past the old 8 MB cap, so identify never
+ * completed. The drain then left the socket mid-frame and the next parse
+ * read JSON payload as a header (op=2 fin=0 plen=125 b1=0x22 -- a quote).
+ * ws_skip_plan is the pure piece, so the silent failure modes are pinned
+ * here instead of on the console. */
+static void test_ws_skip_plan(void) {
+    uint64_t left = 0xdeadbeef;
+
+    /* The real READY, header just eaten, nothing of the body buffered. */
+    ws_skip_plan(11695449, 0, &left);
+    assert(left == 11695449);
+
+    /* Part of the body already buffered: drain only the remainder. */
+    ws_skip_plan(11695449, 65536, &left);
+    assert(left == 11695449 - 65536);
+
+    /* Body fully buffered already -> nothing left to discard. This is the
+     * saturation case; the old bare subtraction underflowed to ~1.8e19 here
+     * and the drain never terminated. */
+    ws_skip_plan(1000, 1000, &left);
+    assert(left == 0);
+    /* More buffered than the header claimed: must still saturate, never wrap. */
+    ws_skip_plan(1000, 5000, &left);
+    assert(left == 0);
+    ws_skip_plan(100, (size_t)-1, &left);
+    assert(left == 0);
+
+    /* Draining to exactly zero must land on zero, not one byte over. */
+    ws_skip_plan(2048, 2047, &left);
+    assert(left == 1);
+    ws_skip_plan(2048, 2048, &left);
+    assert(left == 0);
+
+    /* The cap the console actually hits: 11.7 MB frame, 32 MB buffer. */
+    ws_skip_plan(11695449, 32768, &left);
+    assert(left == 11695449 - 32768);
+    /* A frame larger than even the raised cap still drains sanely. */
+    ws_skip_plan((uint64_t)64 * 1024 * 1024, 0, &left);
+    assert(left == (uint64_t)64 * 1024 * 1024);
+
+
+    /* NULL out-pointer must not crash. */
+    ws_skip_plan(1000, 10, NULL);
+
+    /* The cap must actually be above the measured READY, or every one of
+     * these scenarios returns to the console as a failed connect. */
+    assert(WS_RBUF_MAX > 11706895);
+}
+
+
+ /* The envelope must be reportable BEFORE the body is fully drained.
+ *
+ * Console 2026-10-09: a 5.8 MB READY streamed correctly but took longer than
+ * the 20 s identify deadline, so waiting for the whole frame produced
+ * "no READY after identify (timeout)". op/s/t sit in the first few hundred
+ * bytes, so the caller must be able to act on them immediately while the
+ * remainder drains in the background. */
+static void test_ws_env_early_report(void) {
+    ws_env_t e;
+    char out[256];
+
+    ws_env_init(&e);
+    /* Only the envelope so far -- the "d" object has not arrived. */
+    const char *head = "{\"op\":0,\"s\":41,\"t\":\"READY\",\"d\":{";
+    ws_env_feed(&e, (const unsigned char*)head, strlen(head));
+
+    assert(ws_env_complete(&e));            /* complete despite the body */
+    size_t n = ws_env_render(&e, out, sizeof out);
+    assert(n > 0);
+    assert(strstr(out, "\"t\":\"READY\""));
+
+    /* A missing "s" must not stall the report. op and t are what the callers
+     * read; requiring all three meant one unmatched field blocked the whole
+     * 5.8 MB drain, which is the 2026-10-09 timeout. */
+    ws_env_init(&e);
+    const char *nos = "{\"op\":0,\"t\":\"READY\",\"d\":{";
+    ws_env_feed(&e, (const unsigned char*)nos, strlen(nos));
+    assert(!e.have_s);
+    assert(ws_env_complete(&e));
+    assert(ws_env_render(&e, out, sizeof out) > 0);
+
+    /* Op alone is not enough: is_ready() needs t. */
+    ws_env_init(&e);
+    const char *not_ = "{\"op\":0,\"d\":{";
+    ws_env_feed(&e, (const unsigned char*)not_, strlen(not_));
+    assert(e.have_op && !e.have_t);
+    assert(!ws_env_complete(&e));
+
+    assert(WS_BODY_MAX < 5836474);
+}
+
+static void test_ws_skip_plan_early(void) {
+    /* Re-assert the drain can continue after an early report: arming with 0
+     * leaves the full plen pending, which is what the background drain uses. */
+    uint64_t left = 0;
+    ws_skip_plan(5836474, 0, &left);
+    assert(left == 5836474);
+    /* And a drained frame reports nothing further rather than a lost frame. */
+    ws_skip_plan(0, 0, &left);
+    assert(left == 0);
+}
+
+/* Simulate ws_recv_frame's drain over a real-sized frame with a realistically
+ * full buffer, and prove it consumes EXACTLY plen payload bytes.
+ *
+ * This is the regression test for the 2026-10-09 connect failure. ws.c passed
+ * the already-buffered payload count into ws_skip_plan AND let the drain
+ * consume those bytes again, so the drain stopped payload_here bytes early
+ * and the next parse read mid-payload as a frame header (observed:
+ * op=10 fin=0 plen=116 b1=0x3a b2=0x74 -- ':' and 't' out of READY's "d").
+ * Asserting the helper alone could not catch it; the arithmetic has to be
+ * replayed the way ws_recv_frame actually drives it. */
+static void test_ws_drain_length(void) {
+    const uint64_t plen = 5836474;      /* real READY from the 2026-10-09 log */
+    const size_t   rcap = 65536;        /* WS_BODY_MAX / WS_RBUF_MIN */
+    const size_t   hdr  = 10;           /* 64-bit length prefix */
+
+    /* ws_recv_frame arms the drain with no payload removed, then the drain
+     * loop consumes whatever is buffered before reading more. */
+    uint64_t skip_left = 0;
+    ws_skip_plan(plen, 0, &skip_left);
+    assert(skip_left == plen);
+
+    /* Model the buffer: first read fills it completely. */
+    size_t rlen = rcap;
+    uint64_t consumed = 0;
+    int rounds = 0;
+
+    while(skip_left > 0){
+        size_t take = (size_t)((skip_left < rlen) ? skip_left : rlen);
+        skip_left -= take;
+        consumed += take;
+        rlen -= take;                     /* compaction: rpos back to 0 */
+        if(rlen == 0){                    /* buffer emptied, read more */
+            size_t space = rcap;
+            size_t remaining = (size_t)((skip_left < space) ? skip_left : space);
+            rlen = remaining;
+            skip_left -= remaining;
+            consumed += remaining;
+        }
+        if(++rounds > 100000){ assert(0 && "drain did not terminate"); }
+    }
+
+    /* The whole point: exactly plen bytes consumed, so the next byte read is
+     * the next frame's header. */
+    assert(consumed == plen);
+    assert(rounds > 1);   /* it really did take many rounds */
+
+    /* Replay the buggy arming too: it lands short by exactly the buffered
+     * count, which is what desynced the stream. */
+    uint64_t buggy_skip = 0;
+    ws_skip_plan(plen, rcap - hdr, &buggy_skip);
+    assert(buggy_skip == plen - (rcap - hdr));
+    {
+        size_t rlen2 = rcap, rounds2 = 0;
+        uint64_t consumed2 = 0, sl = buggy_skip;
+        while(sl > 0){
+            size_t take = (size_t)((sl < rlen2) ? sl : rlen2);
+            sl -= take; consumed2 += take; rlen2 -= take;
+            if(rlen2 == 0){
+                size_t sp = rcap;
+                size_t rem = (size_t)((sl < sp) ? sl : sp);
+                rlen2 = rem; sl -= rem; consumed2 += rem;
+            }
+            if(++rounds2 > 100000) break;
+        }
+        /* Short by payload_here -> next parse starts inside the payload. */
+        assert(consumed2 == plen - (uint64_t)(rcap - hdr));
+        assert(consumed2 != plen);
+    }
+}
+
+/* Replica of discord.c's top_val() depth-1 lookup. The rendered envelope is
+ * only useful if THIS can find "t" inside it, and top_val() is static in
+ * discord.c so the host suite cannot call it directly. Kept byte-for-byte in
+ * behaviour: keys only count at depth 1, counted by '{' and '['.
+ *
+ * This is the check that was missing. ws_env_render() originally emitted a
+ * bare "op":0,"t":"READY" with no braces, so depth never reached 1,
+ * is_ready() never matched, and the handshake timed out even though the
+ * envelope came back in one second (console 2026-10-09). */
+static const char *test_top_val(const char *json, size_t len, const char *key){
+    size_t kl = strlen(key);
+    int depth = 0, instr = 0, esc = 0;
+    for(size_t i = 0; i < len; i++){
+        char c = json[i];
+        if(instr){
+            if(esc) esc = 0;
+            else if(c == '\\') esc = 1;
+            else if(c == '"') instr = 0;
+            continue;
+        }
+        if(c == '"'){
+            size_t j = i + 1, k = 0;
+            while(j < len && k < kl && json[j] == key[k]){ j++; k++; }
+            if(k == kl && j < len && json[j] == '"'){
+                j++;
+                while(j < len && (json[j] == ' ' || json[j] == '\t')) j++;
+                if(j < len && json[j] == ':'){
+                    if(depth == 1) return json + j + 1;
+                    i = j; continue;
+                }
+            }
+            instr = 1; continue;
+        }
+        if(c == '{' || c == '[') depth++;
+        else if(c == '}' || c == ']') depth--;
+    }
+    return NULL;
+}
+
+/* The rendered envelope must be readable by the real consumer. */
+static void test_ws_env_renders_parseable(void) {
+    char out[256];
+    ws_env_t e;
+
+    ws_env_init(&e);
+    const char *p = "{\"op\":0,\"s\":41,\"t\":\"READY\",\"d\":{}}";
+    ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+    size_t n = ws_env_render(&e, out, sizeof out);
+    assert(n > 0);
+
+    /* Well-formed object: the braces must be there. */
+    assert(out[0] == '{');
+    assert(out[n - 1] == '}');
+
+    /* And depth-1 lookup, which is what is_ready()/gw_op() actually do. */
+    const char *t = test_top_val(out, n, "t");
+    assert(t != NULL);
+    assert(!memcmp(t, "\"READY\"", 7));
+
+    const char *op = test_top_val(out, n, "op");
+    assert(op != NULL);
+    assert(!memcmp(op, "0", 1));
+
+    const char *s = test_top_val(out, n, "s");
+    assert(s != NULL);
+    assert(!memcmp(s, "41", 2));
+
+    /* "d" was never captured, so it must not be findable. */
+    assert(test_top_val(out, n, "d") == NULL);
+
+    /* A nested "t" must NOT be reachable at depth 1. */
+    ws_env_init(&e);
+    p = "{\"op\":9,\"t\":\"RESUMED\",\"d\":{\"t\":\"NESTED\"}}";
+    ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+    n = ws_env_render(&e, out, sizeof out);
+    t = test_top_val(out, n, "t");
+    assert(t != NULL);
+    assert(!memcmp(t, "\"RESUMED\"", 9));
+}
+
+/* --- oversized-frame envelope scraping ---------------------------------
+ * Buffering READY forced rbuf to double to 16 MB and exhausted console
+ * memory (2026-10-09: "ws: rbuf grow fail", then a permanent connect
+ * failure). The payload is now streamed and only op/s/t kept, so these pin
+ * the extractor that makes that safe. */
+static void test_ws_env(void) {
+    char out[256];
+
+    /* The real shape: envelope first, 12 MB of "d" after. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"op\":0,\"s\":41,\"t\":\"READY\",\"d\":{"
+                        "\"user\":{\"id\":\"1\",\"s\":9},\"guilds\":[]}}";
+        ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+        assert(e.have_op && e.have_s && e.have_t);
+        assert(ws_env_complete(&e));
+        size_t n = ws_env_render(&e, out, sizeof out);
+        assert(n > 0);
+        assert(strstr(out, "\"op\":0"));
+        assert(strstr(out, "\"s\":41"));
+        assert(strstr(out, "\"t\":\"READY\""));
+        assert(!strstr(out, "\"d\""));   /* the 12 MB we never want */
+    }
+
+    /* Nested keys must not be mistaken for the envelope's. This is the real
+     * hazard: "d" contains "s" and "t" of its own. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"op\":9,\"s\":7,\"t\":\"RESUMED\",\"d\":"
+                        "{\"s\":\"SHOULD-NOT-WIN\",\"t\":\"ALSO-NOT\"}}";
+        ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+        assert(!strcmp(e.s, "7"));
+        assert(!strcmp(e.t, "RESUMED"));
+        assert(!strcmp(e.op, "9"));
+    }
+
+    /* Key split across a chunk boundary: "RE" | "ADY". */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *a = "{\"op\":0,\"s\":41,\"t\":\"RE";
+        const char *b = "ADY\",\"d\":{}}";
+        ws_env_feed(&e, (const unsigned char*)a, strlen(a));
+        ws_env_feed(&e, (const unsigned char*)b, strlen(b));
+        assert(!strcmp(e.t, "READY"));
+        assert(ws_env_complete(&e));
+    }
+
+    /* Byte-at-a-time: the worst chunking the socket can produce. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"op\":0,\"s\":41,\"t\":\"READY\",\"d\":{}}";
+        for(size_t i = 0; p[i]; i++) ws_env_feed(&e, (const unsigned char*)p + i, 1);
+        assert(!strcmp(e.op, "0"));
+        assert(!strcmp(e.s, "41"));
+        assert(!strcmp(e.t, "READY"));
+    }
+
+    /* A replacement token can occur after the retained prefix of a large
+     * READY. The scanner must keep working after the early envelope report. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *head = "{\"op\":0,\"s\":41,\"t\":\"READY\",\"d\":{\"padding\":\"";
+        const char *tail = "\",\"auth_token\":\"rotated-secret\"}}";
+        char padding[WS_ENV_WINDOW + 128];
+        memset(padding, 'x', sizeof padding);
+        ws_env_feed(&e, (const unsigned char*)head, strlen(head));
+        ws_env_feed(&e, (const unsigned char*)padding, sizeof padding);
+        assert(!e.have_auth_token);
+        ws_env_feed(&e, (const unsigned char*)tail, strlen(tail));
+        assert(e.have_auth_token);
+        assert(!strcmp(e.auth_token, "rotated-secret"));
+        assert(!e.have_qos_token);
+    }
+
+    /* QoS credentials are server-issued and must survive a chunk boundary. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *a = "{\"op\":0,\"t\":\"READY\",\"d\":{\"qos_token\":\"signed-";
+        const char *b = "qos-value\"}}";
+        ws_env_feed(&e, (const unsigned char*)a, strlen(a));
+        ws_env_feed(&e, (const unsigned char*)b, strlen(b));
+        assert(e.have_qos_token);
+        assert(!strcmp(e.qos_token, "signed-qos-value"));
+    }
+
+    /* Do not capture an auth_token-like string value or an escaped value. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"op\":0,\"t\":\"READY\",\"d\":{"
+                        "\"note\":\"auth_token fake\",\"auth_token\":\"bad\\nvalue\"}}";
+        ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+        assert(!e.have_auth_token);
+    }
+
+    /* Window saturation must not spin forever waiting for more, and must not
+     * overflow the fixed 2 KB window. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        static char big[WS_ENV_WINDOW * 3];
+        memset(big, 'x', sizeof big);
+        ws_env_feed(&e, (const unsigned char*)big, sizeof big);
+        assert(e.winlen == WS_ENV_WINDOW);
+        assert(ws_env_complete(&e));   /* saturated -> done, not stuck */
+        ws_env_feed(&e, (const unsigned char*)big, sizeof big);
+        assert(e.winlen == WS_ENV_WINDOW); /* still bounded */
+    }
+
+    /* Nothing captured -> render returns 0 so the caller keeps the old
+     * "skipped frame" behaviour instead of reading an empty frame. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"d\":{\"huge\":true}}";
+        ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+        assert(ws_env_render(&e, out, sizeof out) == 0);
+    }
+
+    /* Caller buffer too small must refuse rather than truncate into a
+     * malformed JSON envelope. */
+    {
+        ws_env_t e;
+        ws_env_init(&e);
+        const char *p = "{\"op\":0,\"s\":41,\"t\":\"READY\"}";
+        ws_env_feed(&e, (const unsigned char*)p, strlen(p));
+        assert(ws_env_render(&e, out, 4) == 0);
+        assert(ws_env_render(&e, out, sizeof out) > 0);
+    }
+
+    /* NULL safety. */
+    ws_env_init(NULL);
+    ws_env_feed(NULL, (const unsigned char*)"x", 1);
+    assert(ws_env_complete(NULL) == 0);
+    assert(ws_env_render(NULL, out, sizeof out) == 0);
+
+    /* The cap must sit below a real READY or the whole thing is pointless. */
+    assert(WS_BODY_MAX < 11695449);
+}
+
+/* --- community title list (custom.json) ----------------------------------
+ * The final resolver in the chain, and the only one with no prefix gate: it
+ * runs for any TITLEID nothing else could name. Body shape is deliberately
+ * identical to the retro indexes so the same streaming scanner serves both. */
+static void test_custom_extract(void) {
+    char name[CUSTOM_MAX_NAME], url[CUSTOM_MAX_URL];
+    {
+        const char body[] = "[{\"id\":\"ORPC00003\",\"name\":\"No Art\"},"
+                            "{\"id\":\"ORPC00004\",\"name\":\"Other\",\"cover\":\"https://x/other.png\"}]";
+        assert(custom_extract(body, sizeof body - 1, "\"id\":\"ORPC00003\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "No Art"));
+        assert(url[0] == 0);
+        char *bounded = malloc(sizeof body - 1);
+        assert(bounded);
+        memcpy(bounded, body, sizeof body - 1);
+        assert(custom_extract(bounded, sizeof body - 1, "\"id\":\"ORPC00003\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(url[0] == 0);
+        free(bounded);
+        const char truncated[] = "{\"id\":\"ORPC00003\",\"name\":\"Partial";
+        assert(custom_extract(truncated, sizeof truncated - 1, "\"id\":\"ORPC00003\"",
+                              name, sizeof name, url, sizeof url) == 0);
+    }
+
+    /* Pretty-printed entries and reordered fields are valid JSON too. */
+    {
+        const char *spaced = "[{\"name\": \"Spaced Entry\", \"id\": \"ORPC00009\"}]";
+        assert(custom_extract(spaced, strlen(spaced), "\"id\":\"ORPC00009\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "Spaced Entry"));
+    }
+
+    /* Real shape, as written by scripts/add_custom_title.py -- compact. */
+    {
+        const char *body =
+            "[{\"id\":\"ORPC00001\",\"name\":\"First App\","
+            "\"cover\":\"https://x/a.png\"},"
+            "{\"id\":\"ORPC00002\",\"name\":\"Second App\","
+            "\"cover\":\"https://x/b.png\"}]";
+        assert(custom_extract(body, strlen(body), "\"id\":\"ORPC00001\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "First App"));
+        assert(!strcmp(url, "https://x/a.png"));
+
+        assert(custom_extract(body, strlen(body), "\"id\":\"ORPC00002\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "Second App"));
+    }
+
+    /* Entry with no cover: the name must still resolve. Art falls back to the
+     * configured default rather than failing the lookup. */
+    {
+        const char *body = "[{\"id\":\"ORPC00003\",\"name\":\"No Art App\"}]";
+        assert(custom_extract(body, strlen(body), "\"id\":\"ORPC00003\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "No Art App"));
+        assert(url[0] == 0);
+    }
+
+    /* Escapes: names carry quotes and backslashes (same constraint the retro
+     * indexes have, which is why both share jsonstr.c). */
+    {
+        const char *body =
+            "[{\"id\":\"ORPC00004\","
+            "\"name\":\"He said \\\"hi\\\" \\\\ away\"}]";
+        assert(custom_extract(body, strlen(body), "\"id\":\"ORPC00004\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "He said \"hi\" \\ away"));
+    }
+
+    /* Long name must not be hard-truncated mid-way. */
+    {
+        const char *body =
+            "[{\"id\":\"ORPC00005\",\"name\":"
+            "\"Kidou Senshi Gundam Giren no Yabou - Zeon Dokuritsu Sensouden & "
+            "Kidou Senshi Gundam Giren no Yabou - Zeon Dokuritsu Sensouden - "
+            "Kouryaku Shireisho (Gundam The Best)\"}]";
+        assert(custom_extract(body, strlen(body), "\"id\":\"ORPC00005\"",
+                              name, sizeof name, url, sizeof url) == 1);
+        assert(strstr(name, "Gundam The Best") != NULL);
+    }
+
+    /* Miss: buffers cleared, not left holding the previous title. A stale name
+     * here would be posted as the current game's name. */
+    {
+        const char *body = "[{\"id\":\"ORPC00006\",\"name\":\"Other\"}]";
+        strcpy(name, "STALE");
+        strcpy(url, "STALE");
+        assert(custom_extract(body, strlen(body), "\"id\":\"NOTHERE\"",
+                              name, sizeof name, url, sizeof url) == 0);
+        assert(name[0] == 0);
+        assert(url[0] == 0);
+    }
+
+    /* Degenerate input must not read out of bounds. */
+    assert(custom_extract(NULL, 10, "\"id\":\"X\"", name, sizeof name, url, sizeof url) == 0);
+    assert(custom_extract("[]", 2, NULL, name, sizeof name, url, sizeof url) == 0);
+    assert(custom_extract("[", 1, "\"id\":\"X\"", name, sizeof name, url, sizeof url) == 0);
+    assert(custom_extract("[]", 2, "\"id\":\"X\"", NULL, 0, NULL, 0) == 0);
+}
+
+static void test_json_oom_safe(void) {
+    jl_val_t *t = jl_parse("true", 4); assert(t != NULL); jl_free(t);
+    jl_val_t *f = jl_parse("false", 5); assert(f != NULL); jl_free(f);
+    jl_val_t *z = jl_parse("null", 4); assert(z != NULL); jl_free(z);
+    jl_val_t *n = jl_parse("123.5", 5);
+    assert(n && n->type == JL_NUMBER);
+    jl_free(n);
+    /* incomplete pair must fail cleanly, no leak/crash */
+    assert(jl_parse("{\"a\":", 5) == NULL);
+    assert(jl_parse("{\"a\":1", 6) == NULL);
+    /* oversize input refused before any allocation */
+    assert(jl_parse("[]", 5u*1024u*1024u) == NULL);
+}
+static void test_json_hostile(void) {
+    /* 200-deep nesting must be rejected, not stack-smash */
+    char deep[420];
+    memset(deep, '[', 200);
+    memset(deep+200, ']', 200);
+    deep[400] = 0;
+    assert(jl_parse(deep, 400) == NULL);
+    /* 60-deep is fine */
+    char okd[130];
+    memset(okd, '[', 60);
+    memset(okd+60, ']', 60);
+    okd[120] = 0;
+    jl_val_t *r = jl_parse(okd, 120);
+    assert(r && r->type == JL_ARRAY);
+    jl_free(r);
+    /* number running exactly to buffer end (no NUL past it) */
+    char num[16];
+    memcpy(num, "{\"s\":41250}", 11);
+    jl_val_t *r2 = jl_parse(num, 11);
+    assert(r2);
+    assert(jl_obj_get(r2, "s")->num == 41250);
+    jl_free(r2);
+    /* absurd number token fails cleanly */
+    char big[80];
+    memset(big, '9', 70);
+    big[70] = 0;
+    assert(jl_parse(big, 70) == NULL);
+}
+static void test_sfo(void) {
+    /* minimal synthetic param.sfo: header + 1 entry (TITLE="Terraria") */
+    unsigned char sfo[128];
+    char out[64];
+    memset(sfo, 0, sizeof sfo);
+    sfo[0]=0x00; sfo[1]='P'; sfo[2]='S'; sfo[3]='F';
+    sfo[4]=0x01; sfo[5]=0x02;
+    sfo[8]=36; sfo[12]=48; sfo[16]=1;   /* keys@36 data@48 */
+    sfo[20]=0; sfo[21]=0; sfo[22]=0x04; sfo[23]=0; /* key_off=0 fmt=0x0004 */
+    sfo[24]=9; sfo[28]=16; sfo[32]=0;   /* len=9 max=16 data_off=0 */
+    memcpy(sfo+36, "TITLE", 6);
+    memcpy(sfo+48, "Terraria", 9);
+    assert(sfo_title(sfo, 64, out, sizeof out) == 0);
+    assert(strcmp(out, "Terraria") == 0);
+    /* malformed: bad magic, truncated, insane count, OOB offsets */
+    unsigned char bad[64];
+    memset(bad, 0, sizeof bad);
+    assert(sfo_title(bad, sizeof bad, out, sizeof out) != 0);
+    assert(sfo_title(sfo, 10, out, sizeof out) != 0);
+    sfo[16]=200; /* count overflow */
+    assert(sfo_title(sfo, 64, out, sizeof out) != 0);
+    sfo[16]=1; sfo[8]=200; /* key_off OOB */
+    assert(sfo_title(sfo, 64, out, sizeof out) != 0);
+    sfo[8]=36;
+    /* tiny output buffer still safe */
+    assert(sfo_title(sfo, 64, out, 4) == 0);
+    assert(out[3] == 0);
+    /* unterminated key region: must fail, not read OOB */
+    memset(sfo, 0x41, sizeof sfo);
+    sfo[0]=0x00; sfo[1]='P'; sfo[2]='S'; sfo[3]='F';
+    sfo[8]=36; sfo[12]=48; sfo[16]=1;
+    sfo[20]=0; sfo[22]=0x04; sfo[24]=9; sfo[28]=16; sfo[32]=0;
+    assert(sfo_title(sfo, 64, out, sizeof out) != 0);
+}
+static void test_tmdb(void) {
+    unsigned char dig[20];
+    char hex[41];
+    int i;
+    /* SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d4d */
+    tmdb_sha1((const unsigned char *)"abc", 3, dig);
+    for(i=0;i<20;i++) snprintf(hex+2*i, 3, "%02x", dig[i]);
+    assert(strcmp(hex, "a9993e364706816aba3e25717850c26c9cd0d89d") == 0);
+    /* HMAC-SHA1 RFC 2202 case 1 */
+    {
+        unsigned char key[20];
+        memset(key, 0x0b, 20);
+        tmdb_hmac_sha1(key, 20, (const unsigned char *)"Hi There", 8, dig);
+        for(i=0;i<20;i++) snprintf(hex+2*i, 3, "%02x", dig[i]);
+        assert(strcmp(hex, "b617318655057264e28bc0b6fb378c8ef146be00") == 0);
+    }
+    /* URL path must match the hash Sony's live service accepts */
+    {
+        char path[128];
+        assert(tmdb_path("CUSA00740", path, sizeof path) == 0);
+        assert(strcmp(path, "/tmdb2/CUSA00740_00_95C83DE844D155477CB77C577A24D735F2E9AC08/CUSA00740_00.json") == 0);
+        assert(tmdb_path("junk!", path, sizeof path) != 0);
+        assert(tmdb_path("CUSA00740", path, 10) != 0);
+    }
+    /* response parse: name + icon URL.
+     * Sony's icon CDN still answers in http on some titles; Discord silently
+     * drops an activity whose artwork is a non-https external URL, so the
+     * scheme is upgraded rather than the asset being discarded. */
+    {
+        const char body[] = "{\"names\":[{\"name\":\"Terraria\"}],\"icons\":[{\"icon\":\"http://x/y/icon0.png\",\"type\":\"512x512\"}]}";
+        char name[64], icon[128];
+        assert(tmdb_parse(body, sizeof(body)-1, name, sizeof name, icon, sizeof icon) == 0);
+        assert(strcmp(name, "Terraria") == 0);
+        assert(strcmp(icon, "https://x/y/icon0.png") == 0);
+        /* already https: untouched */
+        const char body3[] = "{\"names\":[{\"name\":\"T\"}],\"icons\":[{\"icon\":\"https://x/y/i.png\"}]}";
+        assert(tmdb_parse(body3, sizeof(body3)-1, name, sizeof name, icon, sizeof icon) == 0);
+        assert(strcmp(icon, "https://x/y/i.png") == 0);
+        /* gs2 CDN form from the reference client */
+        const char body4[] = "{\"names\":[{\"name\":\"T\"}],\"icons\":[{\"icon\":\"http://gs2-sec.ww.prod.dl.playstation.net/a/b.png\"}]}";
+        assert(tmdb_parse(body4, sizeof(body4)-1, name, sizeof name, icon, sizeof icon) == 0);
+        assert(strcmp(icon, "https://gs2-sec.ww.prod.dl.playstation.net/a/b.png") == 0);
+        /* non-URL icon rejected, name still wins */
+        const char body2[] = "{\"names\":[{\"name\":\"X\"}],\"icons\":[{\"icon\":\"not a url\"}]}";
+        assert(tmdb_parse(body2, sizeof(body2)-1, name, sizeof name, icon, sizeof icon) == 0);
+        assert(icon[0] == 0);
+        /* no names -> fail */
+        assert(tmdb_parse("{\"icons\":[]}", 12, name, sizeof name, icon, sizeof icon) != 0);
+    }
+}
+static void test_updater(void) {
+    assert(updater_cmp("0.4.0", "0.4.0") == 0);
+    assert(updater_cmp("v0.4.1", "0.4.0") > 0);
+    assert(updater_cmp("0.4.0", "v0.4.1") < 0);
+    assert(updater_cmp("0.10.0", "0.9.9") > 0);
+    assert(updater_cmp("1.0", "1.0.0") == 0);
+    assert(updater_cmp(NULL, "0.1") < 0);
+    /* updater_cmp is the whole update check now: these are the cases that
+     * decide whether a GitHub tag counts as newer than the local version. */
+    assert(updater_cmp("2", "1.0.0") > 0);      /* bare major, seen on console */
+    assert(updater_cmp("1.7.1", "1.0.0") > 0);
+    assert(updater_cmp("v1.1.0", "1.0.0") > 0);  /* leading v stripped */
+    assert(updater_cmp("1.0.0", "1.0.0") == 0);
+    assert(updater_cmp("0.9.9", "1.0.0") < 0);   /* older tag must not notify */
+}
+static void test_art_parse(void) {
+    /* Real external-assets response shape (verified against live API). */
+    const char *body = "[{\"url\":\"https://example.com/a.png\","
+        "\"external_asset_path\":\"external/ABC/https/example.com/a.png\"},"
+        "{\"url\":\"https://example.com/b.png\","
+        "\"external_asset_path\":\"external/DEF/https/example.com/b.png\"}]";
+    char out[128] = {0};
+    assert(art_parse_mp(body, strlen(body),
+                        "https://example.com/b.png", out, sizeof out) == 1);
+    assert(strcmp(out, "mp:external/DEF/https/example.com/b.png") == 0);
+    assert(art_parse_mp(body, strlen(body),
+                        "https://example.com/zzz.png", out, sizeof out) == 0);
+    assert(art_parse_mp("[]", 2, "x", out, sizeof out) == 0);
+    assert(art_parse_mp(NULL, 0, "x", out, sizeof out) == 0);
+    assert(art_resolve_mp("1", "t", "https://example.com/a.png", out, sizeof out) == 0);
+}
+
+static void test_health_safe_mode(void) {
+    /* Unclean-boot marker semantics: normal reboots never count. */
+    char dir[64];
+    assert(make_tmpdir(dir, sizeof dir) == 0);
+    health_set_base(dir);
+    health_mark_clean();
+    /* clean boot x3: counter stays 0, never safe mode */
+    assert(health_boot_note_crash() == 0);
+    health_mark_healthy();
+    assert(health_boot_note_crash() == 0);
+    health_mark_healthy();
+    assert(health_boot_note_crash() == 0);
+    /* now crash repeatedly WITHOUT going healthy: 1, 2, then safe */
+    assert(health_boot_note_crash() == 0); /* count=1 */
+    assert(health_boot_note_crash() == 0); /* count=2 */
+    assert(health_boot_note_crash() == 1); /* count=3 -> safe mode */
+    /* recovery clears */
+    health_mark_healthy();
+    assert(health_boot_note_crash() == 0);
+    health_mark_healthy();
+}
+static void test_base64(void) {
+    char out[32];
+    assert(b64_encode((const unsigned char *)"", 0, out) == 0);
+    assert(strcmp(out, "") == 0);
+    assert(b64_encode((const unsigned char *)"f", 1, out) == 4);
+    assert(strcmp(out, "Zg==") == 0);
+    assert(b64_encode((const unsigned char *)"fo", 2, out) == 4);
+    assert(strcmp(out, "Zm8=") == 0);
+    assert(b64_encode((const unsigned char *)"foo", 3, out) == 4);
+    assert(strcmp(out, "Zm9v") == 0);
+}
+
+static void test_cfg_titles(void) {
+    char dir[64], path[96], path2[96];
+    assert(make_tmpdir(dir, sizeof dir) == 0);
+    snprintf(path, sizeof path, "%s/cfg.json", dir);
+    snprintf(path2, sizeof path2, "%s/cfg2.json", dir);
+    FILE *f = fopen(path, "wb");
+    assert(f);
+    fputs("\xEF\xBB\xBF\r\n{\"token\":\"t\",\"titles\":{\"CUSA11995\":\"Marvel's Spider-Man\","
+          "\"BAD KEY!\": \"junk\", \"CUSA00001\": \"x\", \"TOOLONGTITLEID12345\": \"y\","
+          "\"CUSA00002\": 42}}", f);
+    fclose(f);
+    cfg_t c;
+    assert(cfg_load(path, &c) == 0);
+    cfg_t last_good = c;
+    assert(remove(path) == 0);
+    assert(cfg_load(path, &c) == -1);
+    assert(memcmp(&c, &last_good, sizeof c) == 0);
+    f = fopen(path, "wb");
+    assert(f && fclose(f) == 0);
+    assert(cfg_load(path, &c) == -1);
+    assert(memcmp(&c, &last_good, sizeof c) == 0);
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(memcmp(&c, &last_good, sizeof c) == 0);
+    /* The independent metadata switches must not overwrite each other. */
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"prefix.valid.token\\u0000suffix\"}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t")); /* malformed credential preserves last-good config */
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"first.token.value\",\"token\":\"second.token.value\"}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t"));
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"qos_token\":\"first\",\"qos_token\":\"second\"}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t"));
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("[]", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t"));
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"poll_interval_s\":1e999}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t"));
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"poll_interval_s\":999999999999999999999}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == -1);
+    assert(!strcmp(c.token, "t"));
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"retro_enabled\":false,\"custom_enabled\":true}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == 0);
+    assert(c.retro_enabled == 0 && c.custom_enabled == 1);
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"retro_enabled\":true,\"custom_enabled\":false}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == 0);
+    assert(c.retro_enabled == 1 && c.custom_enabled == 0);
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"show_firmware\":0}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == 0);
+    assert(c.show_firmware == 1); /* only JSON booleans override defaults */
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\",\"titles\":{\"CUSA11995\":\"Marvel's Spider-Man\","
+          "\"BAD KEY!\": \"junk\", \"CUSA00001\": \"x\", \"TOOLONGTITLEID12345\": \"y\","
+          "\"CUSA00002\": 42}}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == 0);
+    assert(c.n_titles == 1); /* only the well-formed entry survives */
+    char name[128];
+    assert(cfg_title(&c, "CUSA11995", name, sizeof name) == 0);
+    assert(!strcmp(name, "Marvel's Spider-Man"));
+    assert(cfg_title(&c, "CUSA99999", name, sizeof name) != 0);
+    assert(cfg_title(&c, "", name, sizeof name) != 0);
+    assert(cfg_title(NULL, "CUSA11995", name, sizeof name) != 0);
+    /* round-trip: save preserves overrides + home_art */
+    strncpy(c.home_art, "pslogo", sizeof c.home_art - 1);
+    strncpy(c.qos_token, "signed-qos-value", sizeof c.qos_token - 1);
+    assert(cfg_save(path2, &c) == 0);
+    struct stat config_st;
+    assert(stat(path2, &config_st) == 0);
+    assert((config_st.st_mode & 0777) == 0600);
+    cfg_t c2;
+    assert(cfg_load(path2, &c2) == 0);
+    assert(c2.n_titles == 1);
+    assert(!strcmp(c2.qos_token, "signed-qos-value"));
+    assert(cfg_title(&c2, "CUSA11995", name, sizeof name) == 0);
+    assert(!strcmp(name, "Marvel's Spider-Man"));
+    assert(!strcmp(c2.home_art, "pslogo"));
+    /* missing titles object: zero overrides, lookup misses */
+    f = fopen(path, "wb");
+    assert(f);
+    fputs("{\"token\":\"t\"}", f);
+    fclose(f);
+    assert(cfg_load(path, &c) == 0);
+    assert(c.n_titles == 0);
+    /* fork: no logo art by default, and no auto-update from upstream. */
+    assert(c.home_art[0] == 0);
+    assert(c.large_art[0] == 0);
+    assert(c.small_art[0] == 0);
+    assert(c.browser_art[0] == 0);
+    assert(c.auto_update == 0);
+}
+
+/* Test-only VFS shim. sqlite's DbPath-based xFullPathname can fail with a
+ * silent SQLITE_CANTOPEN (no syscall, no errno, nothing logged) on some
+ * runners. Our test paths are always absolute, so bypass it with a plain
+ * copy and delegate everything else to the real unix VFS. */
+static sqlite3_vfs g_orx_wrap;
+static int g_orx_installed = 0;
+
+static int orx_fullpath(sqlite3_vfs *p, const char *z, int n, char *o){
+    size_t len = strlen(z) + 1;
+    (void)p;
+    if (len > (size_t)n) return SQLITE_CANTOPEN;
+    memcpy(o, z, len);
+    return SQLITE_OK;
+}
+
+static void orx_vfs_install(void){
+    sqlite3_vfs *under;
+    if (g_orx_installed) return;
+    g_orx_installed = 1;
+    (void)sqlite3_initialize();
+    under = sqlite3_vfs_find(0);
+    if (!under) return;
+    g_orx_wrap = *under; /* inherit szOsFile, mxPathname, all methods */
+    g_orx_wrap.pNext = 0; /* must not link into the old registry list */
+    g_orx_wrap.zName = "orxtest";
+    g_orx_wrap.xFullPathname = orx_fullpath;
+    (void)sqlite3_vfs_register(&g_orx_wrap, 1); /* default for this process */
+}
+
+static void test_appdb(void) {
+    char dir[64], db[96], meta[96], pj[160];
+    orx_vfs_install();
+    assert(make_tmpdir(dir, sizeof dir) == 0);
+    snprintf(db, sizeof db, "%s/app.db", dir);
+    /* Brand-new dir, so a pre-existing app.db is a stale artifact. sqlite
+     * opens with O_NOFOLLOW and fails ELOOP on a symlink where plain
+     * open() would follow it — clear the path before opening. */
+    unlink(db);
+    /* Pre-create so sqlite never exercises its CREATE branch; the test
+     * validates appdb reads/writes on a real file either way. */
+    { int prefd = open(db, O_RDWR|O_CREAT|O_TRUNC, 0600); if (prefd >= 0) close(prefd); }
+    snprintf(meta, sizeof meta, "%s/appmeta", dir);
+    assert(mkdir(meta, 0700) == 0);
+    sqlite3 *s = NULL;
+    (void)sqlite3_initialize();
+    int rc = sqlite3_open_v2(db, &s, SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "DEBUG sqlite3_open_v2 rc=%d db=%s err=%s\n", rc, db, s ? sqlite3_errmsg(s) : "null");
+        sqlite3_close(s);
+    }
+    assert(rc == SQLITE_OK);
+    assert(sqlite3_exec(s, "CREATE TABLE tbl_appbrowse(titleId TEXT, titleName TEXT);", 0, 0, 0) == SQLITE_OK);
+    assert(sqlite3_exec(s, "INSERT INTO tbl_appbrowse VALUES('CUSA11995','Marvel''s Spider-Man');", 0, 0, 0) == SQLITE_OK);
+    assert(sqlite3_exec(s, "CREATE TABLE tbl_appinfo(titleId TEXT, key TEXT, val TEXT);", 0, 0, 0) == SQLITE_OK);
+    assert(sqlite3_exec(s, "INSERT INTO tbl_appinfo VALUES('CUSA00001','TITLE_01','Lang One');", 0, 0, 0) == SQLITE_OK);
+    assert(sqlite3_exec(s, "INSERT INTO tbl_appinfo VALUES('CUSA00001','TITLE','Base Name');", 0, 0, 0) == SQLITE_OK);
+    assert(sqlite3_exec(s, "INSERT INTO tbl_appinfo VALUES('CUSA00002','TITLE','');", 0, 0, 0) == SQLITE_OK);
+    sqlite3_close(s);
+    char name[128];
+    /* tier 1: browse name wins */
+    assert(appdb_title_from(db, meta, "CUSA11995", name, sizeof name) == 0);
+    assert(!strcmp(name, "Marvel's Spider-Man"));
+    /* tier 2: bare TITLE preferred over TITLE_01 */
+    assert(appdb_title_from(db, meta, "CUSA00001", name, sizeof name) == 0);
+    assert(!strcmp(name, "Base Name"));
+    /* empty val rows never match; no param.json staged -> miss */
+    assert(appdb_title_from(db, meta, "CUSA00002", name, sizeof name) != 0);
+    assert(appdb_title_from(db, meta, "CUSA99999", name, sizeof name) != 0);
+    /* tier 3: staged param.json */
+    char gdir[128];
+    snprintf(gdir, sizeof gdir, "%s/CUSA00002", meta);
+    assert(mkdir(gdir, 0700) == 0);
+    snprintf(pj, sizeof pj, "%s/param.json", gdir);
+    FILE *f = fopen(pj, "wb");
+    assert(f);
+    fputs("{\"titleId\":\"CUSA00002\",\"titleName\":\"JSON Game\"}", f);
+    fclose(f);
+    assert(appdb_title_from(db, meta, "CUSA00002", name, sizeof name) == 0);
+    assert(!strcmp(name, "JSON Game"));
+    /* invalid inputs fail soft */
+    assert(appdb_title_from(db, meta, NULL, name, sizeof name) != 0);
+    assert(appdb_title_from(db, meta, "short", name, sizeof name) != 0);
+    assert(appdb_title_from(db, meta, "cusa11995", name, sizeof name) != 0);
+    assert(appdb_title_from(db, meta, "CUSA1199!", name, sizeof name) != 0);
+    assert(appdb_title_from("/nonexistent/app.db", meta, "CUSA11995", name, sizeof name) != 0);
+    assert(appdb_title_from(db, meta, "CUSA11995", NULL, 0) != 0);
+}
+
+static void test_discord_builder(void) {
+    /* game presence: name shown, raw ID nowhere visible, hover has the ID */
+    jl_val_t *a = discord_build_activity("On PS4", "Marvel's Spider-Man","Playing on PlayStation 4","ps_logo_blue",NULL,
+        "CUSA11995", "1574591231785308330", "https://x/icons/", NULL, NULL,
+        1700000000LL, "");
+    assert(a);
+    const jl_val_t *v = jl_obj_get(a, "name");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "Marvel's Spider-Man"));
+    v = jl_obj_get(a, "details");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "Playing on PlayStation 4"));
+    assert(!strstr(v->str, "CUSA")); /* never the raw ID */
+    v = jl_obj_get(a, "state");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "On PS4"));
+    v = jl_obj_get(a, "type");
+    assert(v && v->type == JL_NUMBER && (int)v->num == 0);
+    const jl_val_t *ts = jl_obj_get(a, "timestamps");
+    assert(ts && ts->type == JL_OBJECT);
+    v = jl_obj_get(ts, "start");
+    assert(v && v->type == JL_NUMBER && v->inum == 1700000000LL * 1000LL);
+    const jl_val_t *as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    v = jl_obj_get(as, "large_image");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "cusa11995"));
+    v = jl_obj_get(as, "large_text");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "CUSA11995"));
+    assert(jl_obj_get(as, "small_image") == NULL); /* no badge requested */
+    jl_free(a);
+    /* system badge: mp: URL used as-is with platform hover text */
+    a = discord_build_activity("On PS4", "Marvel's Spider-Man","Playing on PlayStation 4","ps_logo_blue",NULL,
+        "CUSA11995", "1574591231785308330", NULL, NULL, "mp:1/2/logo",
+        1700000000LL, "");
+    assert(a);
+    as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    v = jl_obj_get(as, "small_image");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "mp:1/2/logo"));
+    v = jl_obj_get(as, "small_text");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "PlayStation 4"));
+    jl_free(a);
+    /* media type mapping survives */
+    a = discord_build_activity(NULL, "YouTube","Watching on PlayStation 4","ps_logo_blue",NULL, "CUSA01015", "app",
+        NULL, NULL, NULL, 0, "");
+    assert(a);
+    v = jl_obj_get(a, "type");
+    assert(v && (int)v->num == 0); /* stub maps only CUSA00127 */
+    jl_free(a);
+    a = discord_build_activity(NULL, "Netflix","Watching on PlayStation 4","ps_logo_blue",NULL, "CUSA00127", "app",
+        NULL, NULL, NULL, 0, "");
+    assert(a);
+    v = jl_obj_get(a, "type");
+    assert(v && (int)v->num == 3);
+    jl_free(a);
+    /* home + uploaded key: trusted key used as-is */
+    a = discord_build_activity("On PS4", "PlayStation 4","Idling on Home Menu",NULL,NULL, "home", "app",
+        NULL, "pslogo", NULL, 0, "");
+    assert(a);
+    as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    v = jl_obj_get(as, "large_image");
+    assert(v && !strcmp(v->str, "pslogo"));
+    v = jl_obj_get(as, "large_text");
+    assert(v && !strcmp(v->str, "PlayStation 4"));
+    jl_free(a);
+    /* home with nothing: no assets block at all (never dangling) */
+    a = discord_build_activity("On PS4", "PlayStation 4","Idling on Home Menu",NULL,NULL, "home", "app",
+        NULL, NULL, NULL, 0, "");
+    assert(a);
+    assert(jl_obj_get(a, "assets") == NULL);
+    jl_free(a);
+    /* NULL name rejected */
+    assert(discord_build_activity(NULL, NULL,"Idling on Home Menu",NULL,NULL, "home", "app", NULL, NULL, NULL, 0, "") == NULL);
+}
+
+static void test_discord_rotated_token_take(void){
+    discord_t d;
+    char out[64];
+    memset(&d, 0, sizeof d);
+    assert(discord_take_rotated_token(&d, out, sizeof out) == 0);
+    strcpy(d.ws.rotated_token, "rotated-token");
+    assert(discord_take_rotated_token(&d, out, 4) == -1);
+    assert(d.ws.rotated_token[0] != 0);
+    assert(discord_take_rotated_token(&d, out, sizeof out) == 1);
+    assert(!strcmp(out, "rotated-token"));
+    assert(d.ws.rotated_token[0] == 0);
+    strcpy(d.ws.rotated_token, "bad token");
+    assert(discord_take_rotated_token(&d, out, sizeof out) == -1);
+    assert(d.ws.rotated_token[0] == 0);
+    strcpy(d.ws.qos_token, "signed-qos-value");
+    assert(discord_take_qos_token(&d, out, sizeof out) == 1);
+    assert(!strcmp(out, "signed-qos-value"));
+    assert(d.ws.qos_token[0] == 0);
+}
+
+static void test_discord_identify_builder(void){
+    jl_val_t *p = discord_build_identify("user-token", NULL);
+    assert(p);
+    const jl_val_t *v = jl_obj_get(p, "op");
+    assert(v && v->type == JL_NUMBER && v->inum == 2);
+    const jl_val_t *d = jl_obj_get(p, "d");
+    assert(d && d->type == JL_OBJECT);
+    v = jl_obj_get(d, "token");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "user-token"));
+    assert(jl_obj_get(d, "qos_token") == NULL);
+    jl_free(p);
+
+    p = discord_build_identify("user-token", "signed-qos-value");
+    assert(p);
+    d = jl_obj_get(p, "d");
+    v = jl_obj_get(d, "qos_token");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "signed-qos-value"));
+    jl_free(p);
+    assert(discord_build_identify(NULL, "signed-qos-value") == NULL);
+}
+
+static void test_discord_heartbeat_builder(void){
+    jl_val_t *p = discord_build_heartbeat(42);
+    assert(p);
+    const jl_val_t *v = jl_obj_get(p, "op");
+    assert(v && v->type == JL_NUMBER && v->inum == 1);
+    const jl_val_t *d = jl_obj_get(p, "d");
+    assert(d && d->type == JL_OBJECT);
+    v = jl_obj_get(d, "seq");
+    assert(v && v->type == JL_NUMBER && v->inum == 42);
+    const jl_val_t *q = jl_obj_get(d, "qos");
+    assert(q && q->type == JL_OBJECT);
+    v = jl_obj_get(q, "active");
+    assert(v && v->type == JL_BOOL && v->num == 1);
+    v = jl_obj_get(q, "reasons");
+    assert(v && v->type == JL_ARRAY && v->count == 0);
+    jl_free(p);
+
+    p = discord_build_heartbeat(0);
+    assert(p);
+    d = jl_obj_get(p, "d");
+    v = jl_obj_get(d, "seq");
+    assert(v && v->type == JL_NULL);
+    jl_free(p);
+}
+
+static void test_discord_presence_coalescing(void){
+    discord_t d;
+    memset(&d, 0, sizeof d);
+    d.connected = 1;
+    d.hb_interval_ms = 45000;
+    int64_t now = orbis_mono_s();
+    d.last_heartbeat = now;
+    test_ws_send_ok = 1;
+    test_ws_recv_idle = 1;
+    test_ws_send_calls = 0;
+    for(int i = 0; i < 6; i++) assert(discord_clear_presence(&d) == 0);
+    assert(test_ws_send_calls == 5);
+    assert(d.pending_presence_len > 0);
+    for(size_t i = 0; i < 5; i++) d.presence_sent_at[i] = now - 21;
+    assert(discord_tick(&d) == 0);
+    assert(test_ws_send_calls == 6);
+    assert(d.pending_presence_len == 0);
+    test_ws_send_ok = 0;
+    test_ws_recv_idle = 0;
+}
+
+static int64_t s_stub_arg = -1;
+static int s_stub_calls = 0, s_stub_fail = 0;
+int compat_set_clock(int64_t t){ s_stub_arg = t; s_stub_calls++; return s_stub_fail ? -1 : 0; }
+
+static void test_time_apply_unsynced(void){
+    s_stub_calls = 0;
+    assert(time_apply_offset() == -1 && s_stub_calls == 0);
+}
+
+static void test_time_apply_small_drift(void){
+    s_stub_calls = 0; time_set_offset_for_test(30);
+    assert(time_apply_offset() == 0 && s_stub_calls == 0);
+}
+
+static void test_time_apply_steps_and_zeroes(void){
+    s_stub_calls = 0; s_stub_fail = 0; time_set_offset_for_test(54829587);
+    int64_t before = (int64_t)time(NULL);
+    assert(time_apply_offset() == 0 && s_stub_calls == 1);
+    assert(s_stub_arg >= before + 54829587 - 5 && s_stub_arg <= before + 54829587 + 5);
+    assert(time_apply_offset() == 0 && s_stub_calls == 1);
+}
+
+static void test_time_apply_set_fails_keeps_offset(void){
+    s_stub_calls = 0; s_stub_fail = 1; time_set_offset_for_test(3600);
+    assert(time_apply_offset() == -1 && s_stub_calls == 1);
+    s_stub_fail = 0;
+    assert(time_apply_offset() == 0 && s_stub_calls == 2);
+}
+
+static void test_sess_reset_clears_session(void){
+    daemon_sess_t s;
+    memset(&s, 0xAA, sizeof s);
+    daemon_sess_reset(&s);
+    assert(s.active == 0);
+    assert(s.pres == PS_NONE);
+    assert(s.last[0] == 0);
+    assert(s.sess_tid[0] == 0);
+    assert(s.started == 0);
+    assert(s.last_tsync == 0);
+    assert(s.home_posted == 0);
+    assert(s.prev_tid[0] == 0);
+    assert(s.prev_started == 0 && s.prev_end == 0);
+    assert(s.cand_title[0] == 0);
+    assert(s.cand_hits == 0 && s.miss_hits == 0);
+    assert(s.healthy_marked == 0);
+    assert(s.sess_restored == 0);
+    assert(s.last_reconcile == 0);
+}
+
+static void test_session_restore_validation(void){
+    assert(daemon_session_restore_valid("CUSA12345", 9, 1700000000.0));
+    assert(!daemon_session_restore_valid("CUSA12345", 9, 1e300));
+    assert(!daemon_session_restore_valid("CUSA12345", 9, 1700000000.5));
+    assert(!daemon_session_restore_valid("cusa12345", 9, 1700000000.0));
+    assert(!daemon_session_restore_valid("CUSA12345x", 10, 1700000000.0));
+    assert(!daemon_session_restore_valid("CUSA12345\0x", 10, 1700000000.0));
+}
+
+static int stub_body_ok(void){ return 7; }
+
+static void test_supervise_run_returns_body_code(void){
+    supervise_set_crash_hook(NULL);
+    assert(supervise_run(stub_body_ok) == 7);
+}
+
+static void test_fault_delay_progression(void){
+    assert(supervise_fault_delay(0) == 5);
+    assert(supervise_fault_delay(1) == 10);
+    assert(supervise_fault_delay(2) == 20);
+    assert(supervise_fault_delay(6) == 320);
+    assert(supervise_fault_delay(7) == 600);
+    assert(supervise_fault_delay(100) == 600);
+    assert(supervise_fault_delay(-3) == 5);
+}
+
+static void test_cfg_learn(void) {
+    cfg_t c;
+    cfg_defaults(&c);
+    assert(c.n_titles == 0);
+    assert(cfg_learn(&c, "CUSA11995", "Marvel's Spider-Man") == 1);
+    assert(cfg_learn(&c, "CUSA11995", "Marvel's Spider-Man") == 0); /* dup */
+    assert(cfg_learn(&c, "CUSA11995", "CUSA11995") == 0); /* ID echo refused */
+    assert(cfg_learn(&c, "CUSA11995", "x") == 0); /* too short */
+    assert(cfg_learn(&c, "bad key!", "Name") == 0);
+    assert(cfg_learn(&c, "CUSA11995", "Spider-Man 2") == 1); /* update */
+    char name[128];
+    assert(cfg_title(&c, "CUSA11995", name, sizeof name) == 0);
+    assert(!strcmp(name, "Spider-Man 2"));
+    assert(cfg_learn(NULL, "CUSA11995", "N") == 0);
+    assert(cfg_learn(&c, NULL, "N") == 0);
+    /* full map refuses */
+    c.n_titles = CFG_MAX_TITLES;
+    assert(cfg_learn(&c, "CUSA00001", "Full Game") == 0);
+}
+
+/* --- procwalk: process-table record parsing ---------------------------
+ * detect.c used to hard-code "eboot.bin" at byte 447 and reject records
+ * under 479 bytes. Those are 9.00 numbers; on a firmware that shifts
+ * kinfo_proc the scan reported "no game running" forever and the daemon
+ * posted nothing. procwalk keeps the self-describing ki_structsize framing
+ * but searches for the name instead of trusting an offset, so these tests
+ * pin that down: the 9.00 layout must keep working, and shifted layouts
+ * must now be found. */
+
+/* Write a synthetic kinfo_proc record: leading ki_structsize, then `comm`
+ * (NUL-terminated) at comm_off, zero padding out to recsz. Sizes are native
+ * endian ints -- PS4 and the host runner are both little-endian. The comm is
+ * only written when it fits entirely inside the record, which is how we build
+ * the deliberately-truncated-name case. */
+static size_t put_rec(unsigned char *buf, size_t at, int recsz,
+                      size_t comm_off, const char *comm) {
+    memset(buf + at, 0, (size_t)recsz);
+    memcpy(buf + at, &recsz, sizeof recsz);
+    if (comm && comm_off + strlen(comm) + 1 <= (size_t)recsz)
+        memcpy(buf + at + comm_off, comm, strlen(comm) + 1);
+    return at + (size_t)recsz;
+}
+
+static void put_i32(unsigned char *p, int v) { memcpy(p, &v, sizeof v); }
+
+static void test_procwalk(void) {
+    unsigned char buf[4096];
+    size_t at;
+
+    /* The 9.00 layout this code was written against. Regression guard. */
+    at = put_rec(buf, 0, 479, 447, "eboot.bin");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 1);
+    assert(procwalk_has_comm(buf, at, PROCWALK_EBOOT) == 1);
+    assert(procwalk_first_structsize(buf, at) == 479);
+
+    /* A firmware that grew the record and moved the name. The old 447/479
+     * check missed every one of these and reported "no game running". */
+    at = put_rec(buf, 0, 512, 300, "SystemUI");
+    at = put_rec(buf, at, 736, 611, "eboot.bin");
+    at = put_rec(buf, at, 640, 200, "eapServer");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 1);
+    assert(procwalk_has_comm(buf, at, PROCWALK_EBOOT) == 1);
+    assert(procwalk_first_structsize(buf, at) == 512);
+
+    /* Name shoved right up against the end of the record, terminator in the
+     * very last byte, still found. */
+    at = put_rec(buf, 0, 22, 12, "eboot.bin");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 1);
+
+    /* Two games up -> count 2. */
+    at = put_rec(buf, 0, 479, 447, "eboot.bin");
+    at = put_rec(buf, at, 479, 447, "eboot.bin");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 2);
+
+    /* No match at all is 0 (an error), not -1 (unknown). */
+    at = put_rec(buf, 0, 479, 447, "SystemUI");
+    at = put_rec(buf, at, 600, 500, "webShell");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 0);
+    assert(procwalk_has_comm(buf, at, PROCWALK_EBOOT) == 0);
+
+    /* Empty buffer. */
+    assert(procwalk_count_comm(buf, 0, PROCWALK_EBOOT) == 0);
+    assert(procwalk_has_comm(buf, 0, PROCWALK_EBOOT) == 0);
+    assert(procwalk_first_structsize(buf, 0) == 0);
+
+    /* Broken framing must report "unknown" (-1), never 0. Callers read 0 as
+     * "no game running" and would blank an active presence. */
+    memset(buf, 0, 16);
+    assert(procwalk_count_comm(buf, 16, PROCWALK_EBOOT) == -1);
+    assert(procwalk_has_comm(buf, 16, PROCWALK_EBOOT) == -1);
+    put_i32(buf, 479);
+    put_i32(buf + 479, -8);
+    at = put_rec(buf, 0, 479, 447, "eboot.bin");
+    put_i32(buf + at, -8);
+    assert(procwalk_count_comm(buf, at + 4, PROCWALK_EBOOT) == -1);
+    memset(buf, 0, 16);
+    put_i32(buf, 0);
+    assert(procwalk_count_comm(buf, 16, PROCWALK_EBOOT) == -1);
+
+    /* A final record cut short by the buffer is reported as unknown, never as
+     * the count of the records before it and never read past the end. */
+    at = put_rec(buf, 0, 479, 447, "eboot.bin");
+    at = put_rec(buf, at, 479, 447, "eboot.bin");
+    size_t second = at - 479;
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 2);
+    assert(procwalk_count_comm(buf, second + 300, PROCWALK_EBOOT) == -1);
+    assert(procwalk_count_comm(buf, second + 4, PROCWALK_EBOOT) == -1);
+
+    /* A name too long for its own record is not a match: it must not alias
+     * into whatever record follows it. */
+    at = put_rec(buf, 0, 16, 12, "eboot.bin");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 0);
+
+    /* Prefix of the needle is not a match ("eboot" != "eboot.bin"). */
+    at = put_rec(buf, 0, 479, 447, "eboot");
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == 0);
+
+    /* A record claiming to be larger than the buffer is malformed, not a
+     * clean truncation, so it reports unknown. */
+    at = put_rec(buf, 0, 479, 447, "eboot.bin");
+    put_i32(buf, 999999);
+    assert(procwalk_count_comm(buf, at, PROCWALK_EBOOT) == -1);
+    assert(procwalk_first_structsize(buf, at) == 0);
+
+    /* Bad arguments rejected rather than crashed on. */
+    assert(procwalk_count_comm(NULL, 16, PROCWALK_EBOOT) == -1);
+    assert(procwalk_count_comm(buf, 16, NULL) == -1);
+    assert(procwalk_count_comm(buf, 16, "") == -1);
+    assert(procwalk_first_structsize(NULL, 16) == 0);
+}
+
+/* --- procwalk: record lookup + offset-free pid search -----------------
+ * lock.c and evict.c used to read the process name at byte 447 and the pid at
+ * byte 72 of every kinfo_proc record. Those are 9.00 offsets, so on newer
+ * firmware they addressed the wrong bytes and every live payload looked dead:
+ * evict deleted the lock while the daemon kept running, and lock.c let a
+ * second daemon start alongside the first. procwalk narrows by exact name
+ * first, then searches the record for the pid. */
+static void test_procwalk_find_and_pid(void) {
+    unsigned char buf[4096];
+    size_t at, recsz;
+    const unsigned char *rec;
+
+    /* the layout lock.c/evict.c used to assume still works */
+    at = put_rec(buf, 0, 479, 447, "Payload");
+    put_i32(buf + 72, 1234);
+    assert(procwalk_find_comm(buf, at, "Payload", &rec, &recsz) == 0);
+    assert(rec == buf && recsz == 479);
+    assert(procwalk_record_has_i32(rec, recsz, 1234) == 1);
+    assert(procwalk_record_has_i32(rec, recsz, 9999) == 0);
+
+    /* shifted firmware: record grew, name and pid both moved */
+    at = put_rec(buf, 0, 512, 300, "SystemUI");
+    at = put_rec(buf, at, 736, 611, "Payload");
+    put_i32(buf + 479 + 91, 1234);
+    assert(procwalk_find_comm(buf, at, "Payload", &rec, &recsz) == 0);
+    assert(rec == buf + 512 && recsz == 736);
+    assert(procwalk_record_has_i32(rec, recsz, 1234) == 1);
+    assert(procwalk_record_has_i32(rec, recsz, 4321) == 0);
+
+    /* prefix names must not match: PayloadHelper is not Payload, and kill()
+     * on the wrong pid is the failure this guards */
+    at = put_rec(buf, 0, 479, 447, "PayloadHelper");
+    assert(procwalk_find_comm(buf, at, "Payload", &rec, &recsz) == -2);
+    at = put_rec(buf, 0, 479, 447, "Payload");
+    assert(procwalk_find_comm(buf, at, "Payload", &rec, &recsz) == 0);
+
+    /* nothing matches: -2, distinct from malformed (-1), outputs cleared */
+    at = put_rec(buf, 0, 479, 447, "SystemUI");
+    at = put_rec(buf, at, 600, 500, "eboot.bin");
+    assert(procwalk_find_comm(buf, at, "Payload", &rec, &recsz) == -2);
+    assert(rec == NULL && recsz == 0);
+
+    /* malformed table -> -1 */
+    memset(buf, 0, 16);
+    assert(procwalk_find_comm(buf, 16, "Payload", &rec, &recsz) == -1);
+    put_i32(buf, 479);
+    put_i32(buf + 479, -3);
+    assert(procwalk_find_comm(buf, 483, "Payload", &rec, &recsz) == -1);
+
+    /* empty and bad args */
+    assert(procwalk_find_comm(buf, 0, "Payload", &rec, &recsz) == -2);
+    assert(procwalk_find_comm(NULL, 16, "Payload", &rec, &recsz) == -1);
+    assert(procwalk_find_comm(buf, 16, NULL, &rec, &recsz) == -1);
+    assert(procwalk_find_comm(buf, 16, "Payload", NULL, &recsz) == -1);
+
+    /* the int must lie wholly inside the record */
+    at = put_rec(buf, 0, 16, 0, "Payload");
+    put_i32(buf + 12, 77);
+    assert(procwalk_record_has_i32(buf, 16, 77) == 1);
+    at = put_rec(buf, 0, 15, 0, "Payload");
+    put_i32(buf + 12, 77);
+    assert(procwalk_record_has_i32(buf, 15, 77) == 0);
+
+    /* degenerate args */
+    assert(procwalk_record_has_i32(NULL, 100, 1) == 0);
+    assert(procwalk_record_has_i32(buf, 0, 1) == 0);
+    assert(procwalk_record_has_i32(buf, 3, 1) == 0);
+
+    /* Caveat, pinned down: records are zero-padded and a process name ends in
+     * a NUL, so a record routinely contains the int32 0 in its padding. A hit
+     * is corroboration, not proof -- which is why callers reject pid <= 0
+     * first. Recorded so this is a documented decision, not a surprise. */
+    at = put_rec(buf, 0, 64, 0, "Payload");
+    assert(procwalk_record_has_i32(buf, 64, 0) == 1);
+}
+
+/* --- lock fallback: pid search without a "Payload" name ----------------
+ * On a tester's 13.52 setup the daemon's process is not literally named
+ * "Payload", so lock.c's name-first search missed a live holder and two
+ * daemons ran side by side (doubled + torn log lines, dueling gateway
+ * sessions). The fallback scans every well-formed record for the pid. */
+static void test_procwalk_any_record_pid(void) {
+    unsigned char buf[4096];
+    size_t at;
+
+    at = put_rec(buf, 0, 479, 447, "SceShellUI");
+    put_i32(buf + 72, 4321);
+    at = put_rec(buf, at, 512, 300, "dishen");
+    put_i32(buf + 479 + 91, 4321);
+    /* no "Payload" record anywhere, yet the pid is found */
+    assert(procwalk_any_record_has_i32(buf, at, 4321) == 1);
+    /* pid absent: clean miss */
+    assert(procwalk_any_record_has_i32(buf, at, 9999) == 0);
+    /* pid <= 0 is never a live process (padding is full of int32 0) */
+    assert(procwalk_any_record_has_i32(buf, at, 0) == 0);
+    assert(procwalk_any_record_has_i32(buf, at, -5) == 0);
+
+    /* malformed table fails closed, never "not live" */
+    memset(buf, 0, 16);
+    assert(procwalk_any_record_has_i32(buf, 16, 4321) == -1);
+
+    /* degenerate args */
+    assert(procwalk_any_record_has_i32(NULL, 100, 4321) == -1);
+}
+
+/* --- bigapp: foreground-app classification ----------------------------
+ * The daemon's entire "is a game running" signal. The distinctions that matter
+ * are the ones a single boolean would throw away:
+ *   -1 no big app          -> a game may genuinely have closed
+ *    0 System UI in front  -> a game is probably still running underneath
+ *   -1 unreadable          -> hold whatever we had, never clear
+ * Getting "system UI" or "unreadable" wrong is how presence disappeared while
+ * a game was still open. */
+static void test_bigapp(void) {
+    char out[16];
+
+    /* nothing in front: the only reading that may clear presence */
+    assert(bigapp_classify(-1, -1, "", out, sizeof out) == BIGAPP_NONE);
+    assert(out[0] == 0);
+
+    /* System UI reported as app id 0, and the NPXS namespace: hold, not close */
+    assert(bigapp_classify(0, 0, "", out, sizeof out) == BIGAPP_SYSTEM);
+    assert(bigapp_classify(1, 0, "NPXS20001", out, sizeof out) == BIGAPP_SYSTEM);
+    assert(out[0] == 0);
+
+    /* a real title */
+    assert(bigapp_classify(1, 0, "CUSA00740", out, sizeof out) == BIGAPP_GAME);
+    assert(strcmp(out, "CUSA00740") == 0);
+    /* PS5 backports and PS2 titles use other prefixes; accept all [A-Z0-9] */
+    assert(bigapp_classify(1, 0, "PPSA01234", out, sizeof out) == BIGAPP_GAME);
+    assert(bigapp_classify(1, 0, "ELUA01234", out, sizeof out) == BIGAPP_GAME);
+
+    /* a failed title lookup is unknown, not "no game" */
+    assert(bigapp_classify(1, -1, "", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0x80990003, "CUSA00740", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(out[0] == 0);
+
+    /* malformed title ids: wrong length, lowercase, punctuation, empty */
+    assert(bigapp_classify(1, 0, "", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "CUSA0074", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "CUSA007400", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "cusa00740", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "CUSA-0740", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "CUSA0074\x80", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(out[0] == 0);
+
+    /* a negative app id other than -1: unknown, never "nothing running" */
+    assert(bigapp_classify(-2, 0, "", out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify((int32_t)0x80990003, 0, "", out, sizeof out) == BIGAPP_UNKNOWN);
+
+    /* NULL title must not crash */
+    assert(bigapp_classify(1, 0, NULL, out, sizeof out) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, NULL, NULL, 0) == BIGAPP_UNKNOWN);
+
+    /* a real title but nowhere to write it: unknown rather than a silent
+     * partial copy */
+    assert(bigapp_classify(1, 0, "CUSA00740", NULL, 0) == BIGAPP_UNKNOWN);
+    assert(bigapp_classify(1, 0, "CUSA00740", out, 4) == BIGAPP_UNKNOWN);
+
+    /* validator directly */
+    assert(bigapp_titleid_valid("CUSA00740") == 1);
+    assert(bigapp_titleid_valid("CUSA0074") == 0);
+    assert(bigapp_titleid_valid("cusa00740") == 0);
+    assert(bigapp_titleid_valid(NULL) == 0);
+}
+
+/* --- pkgzone: the homebrew name scrape ---------------------------------
+ * pkg-zone.com is scraped, not queried, so the parsing is pinned down here
+ * against synthetic pages. A layout change upstream must degrade to "no name"
+ * (the caller keeps the raw title id), never to a garbled presence. */
+static void test_pkgzone(void) {
+    char name[128], url[256];
+
+    /* --- which titles are even worth asking about --- */
+    /* retail: TMDB already owns these, never spend a request on them */
+    assert(pkgzone_wants("CUSA00740") == 0);
+    /* retro: deferred, deliberately excluded */
+    assert(pkgzone_wants("SLUS20001") == 0);
+    assert(pkgzone_wants("SCES50361") == 0);
+    assert(pkgzone_wants("ELUA01234") == 0);
+    /* The regression that sent SCUS97399 to pkg-zone at 302/500 every poll:
+     * SCUS is in the retro tables (ps1 + ps2) and must be excluded here. */
+    assert(pkgzone_wants("SCUS97399") == 0);
+    /* and the exclusion is delegated to retro_wants(), not re-listed, so the
+     * two tables cannot drift apart again */
+    assert(retro_wants("SCUS97399") == 1);
+    assert(pkgzone_wants("KOEI12345") == 0);
+    assert(pkgzone_wants("UCUS12345") == 0);
+    /* homebrew prefixes: 4 letters + 5 digits, e.g. LAPY20009 */
+    assert(pkgzone_wants("LAPY20009") == 1);
+    assert(pkgzone_wants("HT0000001") == 1);
+    assert(pkgzone_wants("JBUA20001") == 1);
+    /* shape violations: lowercase, wrong length, non-alnum */
+    assert(pkgzone_wants("lapy20009") == 0);
+    assert(pkgzone_wants("LAPY2000") == 0);
+    assert(pkgzone_wants("LAPY200099") == 0);
+    assert(pkgzone_wants("LAPY-2009") == 0);
+    /* malformed */
+    assert(pkgzone_wants("CUSA") == 0);
+    assert(pkgzone_wants("") == 0);
+    assert(pkgzone_wants(NULL) == 0);
+
+    /* --- a realistic page: boilerplate heading is skipped --- */
+    {
+        const char *html =
+            "<html><head><title>pkg-zone</title></head><body>"
+            "<h1>Install HB-Store on your Playstation</h1>"
+            "<div class=\"image\" style=\"background-image: "
+            "url(/images/LAPY20009/cover.png)\"></div>"
+            "<h1>Some Homebrew App</h1>"
+            "</body></html>";
+        assert(pkgzone_parse(html, strlen(html), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == 0);
+        assert(strcmp(name, "Some Homebrew App") == 0);
+        assert(strcmp(url, "https://pkg-zone.com/images/LAPY20009/cover.png") == 0);
+    }
+
+    /* --- boilerplate only: no usable name --- */
+    {
+        const char *html = "<h1>Install HB-Store on your Playstation</h1>";
+        assert(pkgzone_parse(html, strlen(html), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == -1);
+        assert(name[0] == 0);
+    }
+
+    /* --- whitespace and entities are normalised --- */
+    {
+        const char *html = "<h1>  Retro   Tool &amp; Co  </h1>";
+        assert(pkgzone_parse(html, strlen(html), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == 0);
+        assert(strcmp(name, "Retro Tool & Co") == 0);
+    }
+
+    /* --- unclosed / absent tags must not read past the buffer --- */
+    {
+        const char *html = "<h1>No closing tag here";
+        assert(pkgzone_parse(html, strlen(html), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == -1);
+        const char *nohead = "<body><p>no headings</p></body>";
+        assert(pkgzone_parse(nohead, strlen(nohead), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == -1);
+        /* an empty <h1> must be skipped in favour of the next real one */
+        const char *empty_then_real = "<h1></h1><h1>Real Title</h1>";
+        assert(pkgzone_parse(empty_then_real, strlen(empty_then_real), "LAPY20009",
+                             name, sizeof name, url, sizeof url) == 0);
+        assert(strcmp(name, "Real Title") == 0);
+    }
+
+    /* --- bad arguments --- */
+    assert(pkgzone_parse(NULL, 10, "LAPY20009", name, sizeof name, url, sizeof url) == -1);
+    assert(pkgzone_parse("<h1>x</h1>", 11, NULL, name, sizeof name, url, sizeof url) == -1);
+    assert(pkgzone_parse("<h1>x</h1>", 11, "LAPY20009", NULL, 0, url, sizeof url) == -1);
+    /* title id must be 9 chars: the cover URL is built from it */
+    assert(pkgzone_parse("<h1>x</h1>", 11, "SHORT", name, sizeof name, url, sizeof url) == -1);
+}
+
+/* --- games_cache: the persistent id -> {name, cover} store -------------
+ * Replaces both the config.json titles map and artwork_cache.json. Cover art
+ * was never persisted before this, so a reboot lost it and the presence fell
+ * back to a pack URL that may not exist. */
+static void test_gamecache(void) {
+    gamecache_entry_t e[8];
+    const int64_t now = 1700000000;
+
+    /* --- id validation --- */
+    assert(gamecache_id_valid("CUSA32836") == 1);
+    assert(gamecache_id_valid("LAPY20009") == 1);
+    assert(gamecache_id_valid("cusa32836") == 0);   /* lowercase */
+    assert(gamecache_id_valid("CUSA-3283") == 0);   /* punctuation */
+    assert(gamecache_id_valid("CUSA3283612345678") == 0); /* too long */
+    assert(gamecache_id_valid("") == 0);
+    assert(gamecache_id_valid(NULL) == 0);
+
+    /* --- parse a realistic document --- */
+    {
+        const char *doc =
+            "{\"schema\":1,\"games\":["
+            "{\"id\":\"CUSA32836\",\"name\":\"Some Game\",\"art\":\"https://cdn/x.png\",\"at\":1699999000},"
+            "{\"id\":\"LAPY20009\",\"name\":\"Homebrew\",\"art\":\"\",\"at\":1699999000}"
+            "]}";
+        int n = gamecache_parse(doc, strlen(doc), e, 8, now);
+        assert(n == 2);
+        assert(!strcmp(e[0].id, "CUSA32836"));
+        assert(!strcmp(e[0].name, "Some Game"));
+        assert(!strcmp(e[0].art, "https://cdn/x.png"));
+        assert(!strcmp(e[1].id, "LAPY20009"));
+        assert(e[1].art[0] == 0);   /* empty art is allowed */
+    }
+
+    /* --- malformed rows are skipped, not fatal --- */
+    {
+        const char *doc =
+            "{\"games\":["
+            "{\"id\":\"CUSA32836\",\"name\":\"Good\",\"at\":1699999000},"
+            "{\"id\":\"bad-id\",\"name\":\"Bad\",\"at\":1699999000},"
+            "{\"id\":\"CUSA11111\"},"
+            "{\"name\":\"NoId\",\"at\":1699999000},"
+            "\"notanobject\","
+            "{\"id\":\"CUSA22222\",\"name\":\"Also Good\",\"at\":1699999000}"
+            "]}";
+        int n = gamecache_parse(doc, strlen(doc), e, 8, now);
+        assert(n == 2);
+        assert(!strcmp(e[0].id, "CUSA32836"));
+        assert(!strcmp(e[1].id, "CUSA22222"));
+    }
+
+    /* --- unusable documents --- */
+    assert(gamecache_parse("not json", 8, e, 8, now) == -1);
+    assert(gamecache_parse("[]", 2, e, 8, now) == -1);       /* array at top */
+    assert(gamecache_parse("{}", 2, e, 8, now) == 0);         /* no games key */
+    assert(gamecache_parse(NULL, 10, e, 8, now) == -1);
+    assert(gamecache_parse("{}", 2, NULL, 8, now) == -1);
+    assert(gamecache_parse("{}", 2, e, 0, now) == -1);
+
+    /* --- staleness: an old entry is dropped so it gets re-resolved --- */
+    {
+        char doc[256];
+        snprintf(doc, sizeof doc,
+            "{\"games\":[{\"id\":\"CUSA32836\",\"name\":\"Old\",\"at\":%lld}]}",
+            (long long)(now - GAMECACHE_TTL_SECS - 60));
+        assert(gamecache_parse(doc, strlen(doc), e, 8, now) == 0);
+        /* fresh entry survives */
+        snprintf(doc, sizeof doc,
+            "{\"games\":[{\"id\":\"CUSA32836\",\"name\":\"New\",\"at\":%lld}]}",
+            (long long)(now - 10));
+        assert(gamecache_parse(doc, strlen(doc), e, 8, now) == 1);
+    }
+    /* a missing timestamp is treated as stale, not trusted blindly */
+    {
+        const char *doc = "{\"games\":[{\"id\":\"CUSA32836\",\"name\":\"NoAt\"}]}";
+        assert(gamecache_parse(doc, strlen(doc), e, 8, now) == 0);
+    }
+
+    /* --- round trip, including quotes and backslashes in the name --- */
+    {
+        gamecache_entry_t in[2], out[8];
+        memset(in, 0, sizeof in);
+        strcpy(in[0].id, "CUSA32836");
+        strcpy(in[0].name, "He said \"hi\" \\ back");
+        strcpy(in[0].art, "https://cdn/a.png");
+        in[0].at = now;
+        strcpy(in[1].id, "LAPY20009");
+        strcpy(in[1].name, "Homebrew Tool");
+        in[1].at = now;
+
+        char *json = gamecache_serialize(in, 2);
+        assert(json != NULL);
+        int n = gamecache_parse(json, strlen(json), out, 8, now);
+        assert(n == 2);
+        assert(!strcmp(out[0].id, "CUSA32836"));
+        assert(!strcmp(out[0].name, "He said \"hi\" \\ back"));
+        assert(!strcmp(out[0].art, "https://cdn/a.png"));
+        assert(!strcmp(out[1].name, "Homebrew Tool"));
+        assert(out[1].art[0] == 0);
+        free(json);
+    }
+
+    /* --- serialise edges --- */
+    assert(gamecache_serialize(NULL, 1) == NULL);
+    assert(gamecache_serialize(e, 0) == NULL);
+
+    /* --- `max` really caps --- */
+    {
+        const char *doc =
+            "{\"games\":["
+            "{\"id\":\"CUSA00001\",\"name\":\"A\",\"at\":1699999000},"
+            "{\"id\":\"CUSA00002\",\"name\":\"B\",\"at\":1699999000},"
+            "{\"id\":\"CUSA00003\",\"name\":\"C\",\"at\":1699999000}"
+            "]}";
+        assert(gamecache_parse(doc, strlen(doc), e, 2, now) == 2);
+    }
+
+    /* --- live store: put then get, and art round-trips --- */
+    gamecache_reset();
+    {
+        char nm[64], ar[128];
+        assert(gamecache_get("CUSA32836", nm, sizeof nm, ar, sizeof ar) == 0);
+        assert(gamecache_put("CUSA32836", "Cached Game",
+                             "https://cdn/cover.png", "tmdb") == 1);
+        assert(gamecache_get("CUSA32836", nm, sizeof nm, ar, sizeof ar) == 1);
+        assert(!strcmp(nm, "Cached Game"));
+        assert(!strcmp(ar, "https://cdn/cover.png"));
+        /* id echo is not a name */
+        assert(gamecache_put("CUSA99999", "CUSA99999", "", "tmdb") == 0);
+        /* bad id rejected */
+        assert(gamecache_put("bad id", "X", "", "tmdb") == 0);
+        /* update replaces */
+        assert(gamecache_put("CUSA32836", "Renamed", "", "pkgzone") == 1);
+        assert(gamecache_get("CUSA32836", nm, sizeof nm, ar, sizeof ar) == 1);
+        assert(!strcmp(nm, "Renamed"));
+    }
+    gamecache_reset();
+}
+
+/* --- firmware version normalisation ---------------------------------
+ * The presence card shows this string, so a bad trim is user-visible.
+ * Sony packs the minor as three digits with a trailing sub-patch zero,
+ * which is why "13.520.001" has to render as "13.52", not "13.520". */
+/* fw.c host stub: the only thing it needs from the console is the
+ * firmware string. fw_normalize() itself is pure and fully covered. */
+typedef struct {
+    unsigned long long reserved;
+    char version_string[0x1c];
+    unsigned int version;
+} fw_info_stub_t;
+/* What the stub reports. Overridden by the padded case below so fw_version()
+ * can be driven end-to-end through the whole path, not just fw_normalize(). */
+static const char *s_stub_fw_string = "13.520.001";
+int sceKernelGetSystemSwVersion(fw_info_stub_t *info){
+    if(!info) return -1;
+    memset(info, 0, sizeof *info);
+    snprintf(info->version_string, sizeof info->version_string, "%s",
+             s_stub_fw_string);
+    return 0;
+}
+
+static void test_fw_normalize(void) {
+    static const struct { const char *in; const char *want; } cases[] = {
+        { "13.520.001", "13.52" },
+        { "13.520",     "13.52" },
+        { "13.52",      "13.52" },
+        { "9.000",      "9.00" },
+        { "9.000.001",  "9.00" },
+        { "8.500",      "8.50" },
+        { "11.020",     "11.02" },
+        { "12.000",     "12.00" },
+        { "5.050",      "5.05" },
+        { "7.550",      "7.55" },
+        { "13",         "13" },      /* no minor: left alone */
+        /* Padded by Sony on some firmware -- 9.00 sends " 9.008.031",
+         * verified on console 2026-10-05. digits_ok() rejected the space and
+         * every poll logged "unrecognised version string", so the presence
+         * fell back to "Firmware unknown". */
+        { " 9.008.031", "9.00" },
+        { "  9.000",    "9.00" },    /* more than one space */
+        { " 5.050.123", "5.05" },    /* padded single-digit major */
+        { "\t9.008.031", "9.00" },   /* tab padding */
+        { "9.008.031 ", "9.00" },    /* trailing padding */
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char v[32];
+        snprintf(v, sizeof v, "%s", cases[i].in);
+        fw_normalize(v);
+        assert(!strcmp(v, cases[i].want));
+    }
+    /* end-to-end: fw_version() must render "13.52" for the console the
+     * stub above describes -- exactly what the presence card shows. */
+    {
+        char fw[16];
+        assert(fw_version(fw, sizeof fw) == 0);
+        assert(!strcmp(fw, "13.52"));
+    }
+    /* The regression that reported "unrecognised version string" forever on
+     * 9.00. fw_version() normalises before validating, so a padded string
+     * reaches digits_ok() trimmed. */
+    {
+        static const struct { const char *raw; const char *want; } pad[] = {
+            { " 9.008.031", "9.00" },
+            { "9.008.031",  "9.00" },
+            { " 5.050.123", "5.05" },
+            { " 13.520.001", "13.52" },
+        };
+        for (unsigned i = 0; i < sizeof pad / sizeof pad[0]; i++) {
+            char fw[16];
+            s_stub_fw_string = pad[i].raw;
+            assert(fw_version(fw, sizeof fw) == 0);
+            assert(!strcmp(fw, pad[i].want));
+        }
+        s_stub_fw_string = "13.520.001";
+    }
+    /* Still rejects genuine garbage rather than passing it through. */
+    {
+        char fw[16];
+        s_stub_fw_string = "not-a-version";
+        assert(fw_version(fw, sizeof fw) != 0);
+        assert(!strcmp(fw, "unknown"));
+        s_stub_fw_string = "13.520.001";
+    }
+}
+
+/* --- NPXS is system; app/media ids resolve like anything else -------
+ * Console klog 2026-10-03: NPXS20001 backs SceShellUI plus
+ * SecureUIProcess/SecureWebProcess and is where every AppFocusChanged
+ * event starts, so it must never be posted as a game. ItemzFlow is
+ * ITEM00001, a different namespace, and does resolve. */
+static void test_bigapp_namespaces(void) {
+    char out[16];
+
+    /* NPXS is never a playing game. */
+    assert(bigapp_classify(1, 0, "NPXS20001", out, sizeof out) == BIGAPP_SYSTEM);
+    assert(bigapp_classify(1, 0, "NPXS21002", out, sizeof out) == BIGAPP_SYSTEM);
+    assert(bigapp_classify(1, 0, "NPXS10001", out, sizeof out) == BIGAPP_SYSTEM);
+    assert(out[0] == 0); /* nothing written for a system id */
+
+    /* App and media containers post normally. */
+    assert(bigapp_classify(1, 0, "ITEM00001", out, sizeof out) == BIGAPP_GAME);
+    assert(!strcmp(out, "ITEM00001"));
+    assert(bigapp_classify(1, 0, "CUSA00127", out, sizeof out) == BIGAPP_GAME);
+    assert(bigapp_classify(1, 0, "LAPY20009", out, sizeof out) == BIGAPP_GAME);
+    assert(bigapp_classify(1, 0, "CUSA03887", out, sizeof out) == BIGAPP_GAME);
+}
+
+
+/* --- asset keys land in the right fields ---------------------------
+ * Every parameter here is const char*, so a mis-ordered signature still
+ * compiles: it shipped once and put "ps_logo_full" in the details line.
+ * Assert on values, not on arity. */
+static void test_activity_assets(void) {
+    /* home: idle asset as large image, no badge */
+    jl_val_t *a = discord_build_activity("Firmware 13.52", "PlayStation 4",
+        "Idling on Home Menu", "ps_logo_full", NULL,
+        "home", "app", NULL, NULL, NULL, 0, "");
+    assert(a);
+    const jl_val_t *v = jl_obj_get(a, "details");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "Idling on Home Menu"));
+    const jl_val_t *as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    v = jl_obj_get(as, "large_image");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "ps_logo_full"));
+    assert(jl_obj_get(as, "small_image") == NULL); /* no badge on home */
+    jl_free(a);
+
+    /* playing: game icon large, playing asset as the badge */
+    a = discord_build_activity("Firmware 13.52", "Some Game",
+        "Playing on PlayStation 4", NULL, "ps_logo_blue",
+        "CUSA11995", "app", NULL, NULL, NULL, 1700000000LL, "");
+    assert(a);
+    v = jl_obj_get(a, "details");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "Playing on PlayStation 4"));
+    as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    v = jl_obj_get(as, "large_image");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "cusa11995"));
+    v = jl_obj_get(as, "small_image");
+    assert(v && v->type == JL_STRING && !strcmp(v->str, "ps_logo_blue"));
+    jl_free(a);
+
+    /* an empty key falls back rather than sending an empty asset */
+    a = discord_build_activity("Firmware 13.52", "Some Game",
+        "Playing on PlayStation 4", "", "",
+        "CUSA11995", "app", NULL, NULL, NULL, 0, "");
+    assert(a);
+    as = jl_obj_get(a, "assets");
+    assert(as && as->type == JL_OBJECT);
+    assert(jl_obj_get(as, "small_image") == NULL);
+    jl_free(a);
+}
+
+/* --- retro: prefix routing and the entry extractor -----------------
+ * Pure logic only; the fetch half is payload-only. Driven against the real
+ * index shapes verified on console 2026-10-05: compact, BOM-free, a bare
+ * array of flat {"id","name","cover"} entries. */
+static void test_retro(void) {
+    unsigned char c[3];
+
+    /* PS1-only prefixes: one file, no wasted fetches */
+    assert(retro_wants("SND00123") == 1);
+    assert(retro_candidates_for("SND00123", c) == 1 && c[0] == 0);
+    /* LSD is a 3-character prefix: comparing a fixed 4 bytes would miss it */
+    assert(retro_wants("LSD00123") == 1);
+    assert(retro_candidates_for("LSD00123", c) == 1 && c[0] == 0);
+    /* PS2-only */
+    assert(retro_wants("KOEI12345") == 1);
+    assert(retro_candidates_for("KOEI12345", c) == 1 && c[0] == 1);
+    /* PSP-only */
+    assert(retro_wants("UCUS12345") == 1);
+    assert(retro_candidates_for("UCUS12345", c) == 1 && c[0] == 2);
+
+    /* shared prefixes: SLPM and PBPX are in both PS1 and PS2, and must
+     * come out in check order so the first hit is deterministic */
+    assert(retro_candidates_for("SLPM55265", c) == 2);
+    assert(c[0] == 0 && c[1] == 1);
+    assert(retro_candidates_for("PBPX12345", c) == 2);
+    assert(c[0] == 0 && c[1] == 1);
+
+    /* retail and unknowns are never routed here */
+    assert(retro_wants("CUSA32836") == 0);
+    assert(retro_wants("LAPY20009") == 0);
+    assert(retro_wants("ITEM00001") == 0);
+    assert(retro_wants("") == 0);
+    assert(retro_wants(NULL) == 0);
+
+    /* extraction from a real index body */
+    {
+        const char *body =
+            "[{\"id\":\"SLPM87404\",\"name\":\"A GAME\",\"cover\":\"https://x/a.jpg\"},"
+             "{\"id\":\"SLPM55146\",\"name\":\"OTHER GAME\",\"cover\":\"https://x/b.jpg\"}]";
+        char name[RETRO_MAX_NAME], url[RETRO_MAX_URL];
+        assert(retro_extract(body, strlen(body), "\"id\":\"SLPM55146\"",
+                             name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "OTHER GAME"));
+        assert(!strcmp(url, "https://x/b.jpg"));
+        /* a miss must not invent a name */
+        name[0] = 'X';
+        assert(retro_extract(body, strlen(body), "\"id\":\"NOPE00000\"",
+                             name, sizeof name, url, sizeof url) == 0);
+        assert(name[0] == 0);
+    }
+
+    /* names carry quotes and backslashes; raw bytes would show \\ and \" */
+    {
+        const char *body =
+            "[{\"id\":\"ABCD12345\",\"name\":\"He said \\\"hi\\\" \\\\ away\",\"cover\":\"\"}]";
+        char name[RETRO_MAX_NAME], url[RETRO_MAX_URL];
+        assert(retro_extract(body, strlen(body), "\"id\":\"ABCD12345\"",
+                             name, sizeof name, url, sizeof url) == 1);
+        assert(!strcmp(name, "He said \"hi\" \\ away"));
+        assert(url[0] == 0);              /* empty cover is valid, not fatal */
+    }
+
+    /* the 164-char name in ps2.json must survive intact */
+    {
+        const char *body =
+            "[{\"id\":\"SLPM00001\",\"name\":\"Kidou Senshi Gundam Giren no Yabou - Zeon Dokuritsu Sensouden & Kidou Senshi Gundam Giren no Yabou - Zeon Dokuritsu Sensouden - Kouryaku Shireisho (Gundam The Best)\",\"cover\":\"https://x/g.jpg\"}]";
+        char name[RETRO_MAX_NAME], url[RETRO_MAX_URL];
+        assert(retro_extract(body, strlen(body), "\"id\":\"SLPM00001\"",
+                             name, sizeof name, url, sizeof url) == 1);
+        assert(strlen(name) == 164);
+        assert(strstr(name, "Gundam The Best") != NULL);
+    }
+}
+
+/* --- visibility flags + homebrew classification -------------------
+ * The four show_* flags are a daemon-side decision, so what is testable
+ * here is that they default to on and that is_homebrew_id puts the right
+ * ids in the right bucket -- in particular that retro is never homebrew. */
+static void test_show_flags(void) {
+    cfg_t c;
+    cfg_defaults(&c);
+    /* all on by default: a config that predates the keys keeps today's
+     * behaviour rather than silently hiding everything */
+    assert(c.show_firmware == 1);
+    assert(c.show_idle     == 1);
+    assert(c.show_media    == 1);
+    assert(c.show_homebrew == 1);
+
+    /* is_homebrew_id: the pkg-zone namespace */
+    assert(is_homebrew_id("LAPY20009") == 1);   /* payload-dir homebrew */
+    assert(is_homebrew_id("HT0000001") == 1);
+    assert(is_homebrew_id("ITEM00001") == 1);   /* app container */
+
+    /* retail and system are never homebrew */
+    assert(is_homebrew_id("CUSA32836") == 0);
+    assert(is_homebrew_id("NPXS20001") == 0);
+
+    /* the point of the exclusion: retro must survive show_homebrew:false */
+    assert(is_homebrew_id("SLPM55146") == 0);
+    assert(is_homebrew_id("UCUS12345") == 0);
+    assert(is_homebrew_id("KOEI12345") == 0);
+
+    /* degenerate input */
+    assert(is_homebrew_id(NULL) == 0);
+    assert(is_homebrew_id("") == 0);
+    assert(is_homebrew_id("AB") == 0);
+}
+
+/* ---- fork: local appmeta + Cloudinary ---- */
+static size_t lm_build_sfo(unsigned char *b, const char *title){
+    /* header(20) + 1 entry(16) + key "TITLE\0" + data */
+    memset(b, 0, 256);
+    uint32_t magic = 0x46535000u, ver = 0x0101u, key_off = 36, data_off = 44, count = 1;
+    memcpy(b, &magic, 4); memcpy(b+4, &ver, 4); memcpy(b+8, &key_off, 4);
+    memcpy(b+12, &data_off, 4); memcpy(b+16, &count, 4);
+    uint16_t koff = 0, fmt = 0x0004; uint32_t len = (uint32_t)strlen(title)+1, mx = 128, doff = 0;
+    memcpy(b+20, &koff, 2); memcpy(b+22, &fmt, 2); memcpy(b+24, &len, 4);
+    memcpy(b+28, &mx, 4); memcpy(b+32, &doff, 4);
+    memcpy(b+36, "TITLE", 6);
+    memcpy(b+44, title, len);
+    return 44 + len;
+}
+
+static void lm_write(const char *path, const void *d, size_t n){
+    FILE *f = fopen(path, "wb"); assert(f);
+    assert(fwrite(d, 1, n, f) == n); fclose(f);
+}
+
+static void test_localmeta_cloudinary(void) {
+    /* tid validation / traversal */
+    assert(localmeta_tid_valid("CUSA12345"));
+    assert(!localmeta_tid_valid("../../etc"));
+    assert(!localmeta_tid_valid("cusa12345"));
+    assert(!localmeta_tid_valid("CUSA1234"));
+    char p[256];
+    assert(localmeta_join("/b", "CUSA12345", "param.sfo", p, sizeof p) == 0);
+    assert(strcmp(p, "/b/CUSA12345/param.sfo") == 0);
+    assert(localmeta_join("/b", "../x", "param.sfo", p, sizeof p) == -1);
+    assert(localmeta_join("/b", "CUSA12345", "param.sfo", p, 8) == -1);
+
+    /* real files in a temp tree: sfo dir + img dir, with fallback */
+    char root[] = "/tmp/lmtestXXXXXX";
+    assert(mkdtemp(root));
+    char sfod[64], imgd[64], cmd[400];
+    snprintf(sfod, sizeof sfod, "%s/sfo", root);
+    snprintf(imgd, sizeof imgd, "%s/img", root);
+    snprintf(cmd, sizeof cmd, "mkdir -p %s/CUSA12345 %s/CUSA12345 %s/CUSA99999", sfod, imgd, imgd);
+    assert(system(cmd) == 0);
+    unsigned char sfo[256];
+    size_t n = lm_build_sfo(sfo, "My Local Game");
+    snprintf(p, sizeof p, "%s/CUSA12345/param.sfo", sfod); lm_write(p, sfo, n);
+    snprintf(p, sizeof p, "%s/CUSA12345/icon0.png", imgd); lm_write(p, "\x89PNG", 4);
+    char out[128];
+    assert(localmeta_title(sfod, imgd, "CUSA12345", out, sizeof out) == 0);
+    assert(strcmp(out, "My Local Game") == 0);
+    assert(localmeta_icon_path(sfod, imgd, "CUSA12345", p, sizeof p) == 0);
+    assert(strstr(p, "/img/CUSA12345/icon0.png"));
+    /* "or else": sfo only in the image dir */
+    n = lm_build_sfo(sfo, "Else Game");
+    snprintf(p, sizeof p, "%s/CUSA99999/param.sfo", imgd); lm_write(p, sfo, n);
+    assert(localmeta_title(sfod, imgd, "CUSA99999", out, sizeof out) == 0);
+    assert(strcmp(out, "Else Game") == 0);
+    assert(localmeta_icon_path(sfod, imgd, "CUSA99999", p, sizeof p) == -1);
+    assert(localmeta_title(sfod, imgd, "CUSA00000", out, sizeof out) == -1);
+    snprintf(cmd, sizeof cmd, "rm -rf %s", root); assert(system(cmd) == 0);
+
+    /* public id */
+    char pid[160];
+    assert(cld_public_id("ps4", "CUSA12345", "icon0", pid, sizeof pid) == 0);
+    assert(strcmp(pid, "ps4/CUSA12345_icon0") == 0);
+    assert(cld_public_id("ps4/", "CUSA12345", "icon0", pid, sizeof pid) == 0);
+    assert(strcmp(pid, "ps4/CUSA12345_icon0") == 0);
+    assert(cld_public_id("", "CUSA12345", "icon0", pid, sizeof pid) == 0);
+    assert(strcmp(pid, "CUSA12345_icon0") == 0);
+    assert(cld_public_id("a/../b", "CUSA12345", "icon0", pid, sizeof pid) == -1);
+    assert(cld_public_id("ps 4", "CUSA12345", "icon0", pid, sizeof pid) == -1);
+
+    /* multipart framing */
+    char head[512], tail[64];
+    int hl = cld_multipart_head(head, sizeof head, "BND", "PS4PS4", "ps4/CUSA12345_icon0");
+    assert(hl > 0);
+    assert(strstr(head, "name=\"upload_preset\"\r\n\r\nPS4PS4\r\n"));
+    assert(strstr(head, "name=\"public_id\"\r\n\r\nps4/CUSA12345_icon0\r\n"));
+    assert(strstr(head + hl - 4, "\r\n\r\n"));           /* body bytes follow */
+    assert(cld_multipart_head(head, sizeof head, "B", "bad preset", "x") == -1);
+    assert(cld_multipart_head(head, 20, "BND", "PS4PS4", "x") == -1);
+    assert(cld_multipart_tail(tail, sizeof tail, "BND") == (int)strlen("\r\n--BND--\r\n"));
+
+    /* response parsing */
+    const char *ok = "{\"public_id\":\"ps4/CUSA12345_icon0\","
+        "\"secure_url\":\"https://res.cloudinary.com/u7sphtjn/image/upload/v1/ps4/CUSA12345_icon0.png\"}";
+    char url[256];
+    assert(cld_parse_url(ok, strlen(ok), url, sizeof url) == 0);
+    assert(cld_url_ok(url));
+    const char *evil = "{\"secure_url\":\"https://evil.example/x.png\"}";
+    assert(cld_parse_url(evil, strlen(evil), url, sizeof url) == -1);
+    const char *err = "{\"error\":{\"message\":\"Upload preset not found\"}}";
+    assert(cld_parse_url(err, strlen(err), url, sizeof url) == -1);
+    assert(cld_parse_url("not json", 8, url, sizeof url) == -1);
+    assert(cld_upload_png("u7sphtjn", "PS4PS4", "x", "/nonexistent", url, sizeof url) == -1);
+}
+
+int main(void) {
+    /* First: pure parsing, no I/O, no fixtures. The pre-existing
+     * test_appdb failure aborts the binary, so anything listed after it
+     * would never run. */
+    test_activity_assets();
+    test_bigapp();
+    test_retro();
+    test_show_flags();
+    test_bigapp_namespaces();
+    test_pkgzone();
+    test_gamecache();
+    test_fw_normalize();
+    test_procwalk();
+    test_procwalk_find_and_pid();
+    test_procwalk_any_record_pid();
+    test_json();
+    test_gateway_op_spoof();
+    test_ws_skip_plan();
+    test_ws_drain_length();
+    test_ws_env_renders_parseable();
+    test_custom_extract();
+    test_ws_env();
+    test_ws_env_early_report();
+    test_ws_skip_plan_early();
+    test_json_oom_safe();
+    test_json_hostile();
+    test_tmdb();
+    test_updater();
+    test_sfo();
+    test_base64();
+    test_art_parse();
+    test_localmeta_cloudinary();
+    test_health_safe_mode();
+    test_cfg_titles();
+    test_cfg_learn();
+    test_appdb();
+    test_discord_builder();
+    test_discord_rotated_token_take();
+    test_discord_identify_builder();
+    test_discord_heartbeat_builder();
+    test_discord_presence_coalescing();
+    test_time_apply_unsynced();
+    test_time_apply_small_drift();
+    test_time_apply_steps_and_zeroes();
+    test_time_apply_set_fails_keeps_offset();
+    test_sess_reset_clears_session();
+    test_session_restore_validation();
+    test_supervise_run_returns_body_code();
+    test_fault_delay_progression();
+    puts("utility tests passed");
+    return 0;
+}

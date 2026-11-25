@@ -1,0 +1,43 @@
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v5
+      - name: Submit URLs to IndexNow
+        continue-on-error: true
+        run: |
+          KEY="f693088c6de3ae1d62b64ffe3454ecb8"
+          # Uses YOUR account and repo name automatically (zinou01.github.io/Dis-HEN)
+          HOST="${GITHUB_REPOSITORY_OWNER,,}.github.io"
+          BASE="${GITHUB_REPOSITORY#*/}"
+          curl -s -X POST "https://api.indexnow.org/indexnow" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            -d "{\"host\":\"$HOST\",\"key\":\"$KEY\",\"keyLocation\":\"https://$HOST/$BASE/$KEY.txt\",\"urlList\":[\"https://$HOST/$BASE/\",\"https://$HOST/$BASE/best-ps4-tools.html\",\"https://$HOST/$BASE/about-dishen.html\",\"https://$HOST/$BASE/guide.html\",\"https://$HOST/$BASE/llms.txt\"]}"

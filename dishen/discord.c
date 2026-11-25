@@ -1,0 +1,761 @@
+/* discord.c - Discord gateway client using a USER SESSION token.
+ *
+ * Flow: TLS websocket -> HELLO(op10) -> IDENTIFY(op2) -> READY(dispatch) ->
+ * presence updates (op3) + heartbeats (op1/op11).
+ *
+ * Fresh IDENTIFY per connection (no RESUME): the identify budget is 1000/24h,
+ * far above our reconnect rate, and skipping RESUME removes session-state
+ * bookkeeping entirely. Close frames are parsed so a rejected token
+ * (close 4004) is reported as fatal instead of looping forever.
+ */
+#include "discord.h"
+#include "ws_frame.h"
+#include "clock.h"
+#include "b64.h"
+#include "log.h"
+#include "notify.h"
+#include "art.h"
+#include "jsonlite.h"
+#include "detect.h"
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <limits.h>
+
+#define GW_HOST "gateway.discord.gg"
+#define GW_PORT 443
+#define GW_PATH "/?v=10&encoding=json"
+
+static void make_key(char *out){
+    unsigned char b[16];
+    memset(b, 0, sizeof b);
+    int fd=open("/dev/urandom",O_RDONLY);
+    if(fd>=0){
+        size_t got = 0;
+        while(got < sizeof b){
+            long r = read(fd, (char *)b + got, sizeof b - got);
+            if(r <= 0) break;
+            got += (size_t)r;
+        }
+        close(fd);
+        if(got < sizeof b){
+            /* short read: mix time in rather than leaving stack bytes */
+            uint32_t t = (uint32_t)time(NULL);
+            for(size_t i = got; i < sizeof b; i++, t = t*1664525u + 1013904223u)
+                b[i] ^= (unsigned char)(t >> 24);
+        }
+    }
+    else { for(int i=0;i<16;i++) b[i]=(unsigned char)(time(NULL)+i*7); }
+    b64_encode(b,16,out);
+}
+
+static uint32_t random_u32(void){
+    uint32_t value = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if(fd >= 0){
+        size_t got = 0;
+        while(got < sizeof value){
+            long n = read(fd, (char *)&value + got, sizeof value - got);
+            if(n <= 0) break;
+            got += (size_t)n;
+        }
+        close(fd);
+        if(got == sizeof value) return value;
+    }
+    /* Jitter is not a secret; monotonic time gives a safe fallback. */
+    return (uint32_t)time(NULL) ^ (uint32_t)orbis_mono_s() * 2654435761u;
+}
+
+/* Gateway events live INSIDE the JSON text payload ("op":N) — not in the
+ * WebSocket frame header (1=text, 8=close, 9=ping). Scan top-level keys
+ * with string-awareness so a nested `"op":` inside a string value can't
+ * spoof the event type. Works on truncated buffers too (op/s/t sit at the
+ * payload prefix, while the megabyte-long "d" blob may be cut off). */
+static const char *top_val(const char *json, size_t len, const char *key){
+    size_t kl = strlen(key);
+    int depth = 0, instr = 0, esc = 0;
+    for(size_t i = 0; i < len; i++){
+        char c = json[i];
+        if(instr){
+            if(esc) esc = 0;
+            else if(c == '\\') esc = 1;
+            else if(c == '"') instr = 0;
+            continue;
+        }
+        if(c == '"'){
+            /* possible key: must be at depth 1 followed by optional ws + ':' */
+            size_t j = i + 1, k = 0;
+            while(j < len && k < kl && json[j] == key[k]){ j++; k++; }
+            if(k == kl && j < len && json[j] == '"'){
+                j++;
+                while(j < len && (json[j]==' '||json[j]=='\t')) j++;
+                if(j < len && json[j] == ':'){
+                    if(depth == 1) return json + j + 1;
+                    /* nested same-name key: skip its string opener below */
+                    i = j; continue;
+                }
+            }
+            instr = 1; continue;
+        }
+        if(c == '{' || c == '[') depth++;
+        else if(c == '}' || c == ']') depth--;
+    }
+    return NULL;
+}
+static int gw_op(const char *json, size_t len){
+    const char *v = top_val(json, len, "op");
+    if(!v) return -1;
+    while(v < json+len && (*v==' '||*v=='\t')) v++;
+    if(v >= json+len || *v<'0' || *v>'9') return -1;
+    int op = 0;
+    while(v < json+len && *v>='0' && *v<='9'){
+        int digit = *v++ - '0';
+        if(op > (INT_MAX - digit) / 10) return -1;
+        op = op*10 + digit;
+    }
+    if(v < json+len && *v != ',' && *v != '}' && *v != ' ' &&
+       *v != '\t' && *v != '\r' && *v != '\n') return -1;
+    return op;
+}
+static void gw_seq(discord_t *d, const char *json, size_t len){
+    if(!d) return;
+    const char *v = top_val(json, len, "s");
+    if(!v) return;
+    while(v < json+len && (*v==' '||*v=='\t')) v++;
+    if(v >= json+len || *v<'0' || *v>'9') return; /* null or missing: not a seq */
+    int s = 0;
+    while(v < json+len && *v>='0' && *v<='9'){
+        int digit = *v++ - '0';
+        if(s > (INT_MAX - digit) / 10) return;
+        s = s*10 + digit;
+    }
+    if(v < json+len && *v != ',' && *v != '}' && *v != ' ' &&
+       *v != '\t' && *v != '\r' && *v != '\n') return;
+    d->seq = s;
+}
+static int is_ready(const char *json, size_t len){
+    const char *v = top_val(json, len, "t");
+    if(!v) return 0;
+    while(v < json+len && (*v==' '||*v=='\t')) v++;
+    return (size_t)(json+len-v) >= 7 && !memcmp(v, "\"READY\"", 7);
+}
+
+static int valid_gateway_json(const char *json){
+    jl_val_t *v = jl_parse(json, strlen(json));
+    int valid = v && v->type == JL_OBJECT;
+    jl_free(v);
+    return valid;
+}
+
+/* recv one frame with a deadline; -4 = timed out. Skipped oversized frames
+ * (-3) are logged and retried transparently. */
+static int rx_frame(discord_t *d, char *buf, size_t cap, int *op, int *fin, int64_t deadline){
+    for(;;){
+        int nr=ws_recv_frame(&d->ws,buf,cap,op,fin);
+        if(nr==-3){ log_msg("skipped oversized gateway frame"); continue; }
+        if(nr!=0) return nr;
+        if(orbis_mono_s()>deadline) return -4;
+        usleep(50000);
+    }
+}
+
+static int close_status_payload(const char *buf, int len, unsigned *code){
+    return ws_close_payload_valid((const unsigned char *)buf, (size_t)len,
+                                  code);
+}
+
+jl_val_t *discord_build_identify(const char *token, const char *qos_token){
+    if(!token || !token[0]) return NULL;
+    jl_val_t *root=jl_new_object();
+    if(!root) return NULL;
+    jl_obj_set(root,"op",jl_new_int(2));
+    jl_val_t *dd=jl_new_object();
+    if(!dd){ jl_free(root); return NULL; }
+    jl_obj_set(dd,"token",jl_new_string(token));
+    jl_val_t *pp=jl_new_object();
+    if(!pp){ jl_free(dd); jl_free(root); return NULL; }
+    jl_obj_set(pp,"os",jl_new_string("windows"));
+    jl_obj_set(pp,"browser",jl_new_string("Discord Client"));
+    jl_obj_set(pp,"device",jl_new_string(""));
+    jl_obj_set(dd,"properties",pp);
+    jl_val_t *pr=jl_new_object();
+    if(!pr){ jl_free(dd); jl_free(root); return NULL; }
+    jl_obj_set(pr,"status",jl_new_string("online"));
+    jl_obj_set(pr,"activities",jl_new_array());
+    jl_obj_set(pr,"afk",jl_new_bool(0));
+    jl_obj_set(pr,"since",jl_new_null());
+    jl_obj_set(dd,"presence",pr);
+    if(qos_token && qos_token[0])
+        jl_obj_set(dd,"qos_token",jl_new_string(qos_token));
+    jl_obj_set(root,"d",dd);
+    return root;
+}
+
+jl_val_t *discord_build_heartbeat(int seq){
+    jl_val_t *root = jl_new_object();
+    jl_val_t *d = jl_new_object();
+    jl_val_t *qos = jl_new_object();
+    if(!root || !d || !qos){ jl_free(root); jl_free(d); jl_free(qos); return NULL; }
+    jl_obj_set(root, "op", jl_new_int(1));
+    jl_obj_set(d, "seq", seq > 0 ? jl_new_int(seq) : jl_new_null());
+    jl_obj_set(qos, "active", jl_new_bool(1));
+    jl_obj_set(qos, "reasons", jl_new_array());
+    jl_obj_set(d, "qos", qos);
+    jl_obj_set(root, "d", d);
+    return root;
+}
+
+static int send_identify(discord_t *d, const char *token, const char *qos_token){
+    jl_val_t *root=discord_build_identify(token, qos_token);
+    if(!root) return -1;
+    char *s=jl_stringify(root); jl_free(root);
+    if(!s) return -1;
+    int rc = ws_send_text(&d->ws,s,strlen(s));
+    free(s);
+    return rc < 0 ? -1 : 0;
+}
+
+static int heartbeat_send(discord_t *d, int64_t now);
+
+int discord_connect(discord_t *d, const char *token, const char *qos_token){
+    if(!d) return -1;
+    memset(d,0,sizeof(*d));
+    if(!token || !token[0]) return -1;
+    if(strlen(token) >= sizeof d->token ||
+       (qos_token && strlen(qos_token) >= sizeof d->qos_token)){
+        log_msg("discord: credential exceeds session capacity");
+        return -1;
+    }
+    strncpy(d->token, token, sizeof d->token-1);
+    d->token[sizeof d->token-1] = 0;
+    if(qos_token && qos_token[0]){
+        strncpy(d->qos_token, qos_token, sizeof d->qos_token - 1);
+        d->qos_token[sizeof d->qos_token - 1] = 0;
+    }
+    char key[64]=""; make_key(key);
+    int rc=ws_connect(&d->ws, GW_HOST, GW_PORT, GW_PATH, key);
+    if(rc){ log_msg("ws connect fail %d",rc); return -1; }
+    d->connected=1;
+    int64_t now=orbis_mono_s();
+    d->last_heartbeat=now; d->last_ack=now;
+    /* HELLO (text frame carrying {"op":10,...}) */
+    char buf[2048]; int op=0,fin=0;
+    int nr=rx_frame(d,buf,sizeof buf,&op,&fin,now+15);
+    if(nr==-4){ log_msg("no HELLO (timeout)"); ws_close(&d->ws); d->connected=0; return -1; }
+    if(nr<=0 || op!=1){
+        log_msg("no HELLO (nr=%d op=%d)",nr,op);
+        ws_close(&d->ws); d->connected=0;
+        return -1;
+    }
+    jl_val_t *h=jl_parse(buf,nr);
+    if(h){
+        const jl_val_t *dd=jl_obj_get(h,"d");
+        if(dd){
+            const jl_val_t *hi=jl_obj_get(dd,"heartbeat_interval");
+            if(hi&&hi->type==JL_NUMBER && hi->num >= 0.0 &&
+               hi->num <= (double)INT_MAX)
+                d->hb_interval_ms=(int64_t)hi->num;
+        }
+        jl_free(h);
+    }
+    if(!d->hb_interval_ms) d->hb_interval_ms=45000;
+    if(d->hb_interval_ms < 5000){
+        log_msg("discord: hb_interval %lldms suspiciously small; clamping to 5000",
+                (long long)d->hb_interval_ms);
+        d->hb_interval_ms = 5000;
+    }
+    {
+        long hb_s = (long)(d->hb_interval_ms / 1000);
+        long fire = hb_s > 3 ? hb_s - 2 : hb_s;
+        long jitter = hb_s > 0 ? (long)(random_u32() % (uint32_t)hb_s) : 0;
+        d->last_heartbeat = orbis_mono_s() + jitter - fire;
+    }
+    if(send_identify(d, token, d->qos_token) < 0){
+        log_msg("discord: identify send failed");
+        ws_close(&d->ws); d->connected=0;
+        return -1;
+    }
+    log_msg("discord: identify sent, hb=%llds",(long long)(d->hb_interval_ms/1000));
+    /* READY confirms the token was accepted. `op` is the WebSocket frame
+     * type; the gateway event is JSON inside — parse it, don't switch on it. */
+    int64_t dl=orbis_mono_s()+20;
+    for(;;){
+        nr=rx_frame(d,buf,sizeof buf,&op,&fin,dl);
+        if(nr==-4){ log_msg("no READY after identify (timeout)"); break; }
+        if(nr<=0){ log_msg("no READY after identify (nr=%d)",nr); break; }
+        if(op==8){
+            if(!fin){ log_msg("fragmented close; reconnecting"); ws_close(&d->ws); d->connected=0; return -1; }
+            unsigned code = 0;
+            if(!close_status_payload(buf, nr, &code)){
+                log_msg("malformed close payload (len %d); reconnecting", nr);
+                ws_close(&d->ws); d->connected=0; return -1;
+            }
+            log_msg("gateway closed during auth: %u",code);
+            ws_close(&d->ws); d->connected=0;
+            return code==4004 ? -2 : -1;
+        }
+        if(op==9){
+            if(ws_pong(&d->ws, (const unsigned char *)buf, (size_t)nr) < 0){
+                log_msg("websocket PONG send failed during auth");
+                ws_close(&d->ws); d->connected=0; return -1;
+            }
+            continue;
+        }
+        if(op!=1) continue;
+        if(!valid_gateway_json(buf)){
+            log_msg("malformed gateway JSON during auth");
+            break;
+        }
+        int go = gw_op(buf, (size_t)nr);
+        if(go==1){
+            if(heartbeat_send(d, orbis_mono_s()) < 0){
+                log_msg("requested heartbeat send failed during auth");
+                ws_close(&d->ws); d->connected=0; return -1;
+            }
+            continue;
+        }
+        if(go==11){ d->last_ack=orbis_mono_s(); continue; }
+        if(go==0 && is_ready(buf, (size_t)nr)){
+            gw_seq(d, buf, (size_t)nr);
+            log_msg("discord: gateway ready");
+            /* The "connected" notification is raised by the daemon, which
+             * knows whether this was a first connect or a recovery after a
+             * failed one. Firing it here meant every successful READY
+             * notified -- once per reconnect. */
+            return 0;
+        }
+        /* other pre-READY events: ignore */
+    }
+    ws_close(&d->ws); d->connected=0;
+    return -1;
+}
+
+int discord_take_rotated_token(discord_t *d, char *out, size_t cap){
+    if(!d || !out || cap == 0 || !d->ws.rotated_token[0]) return 0;
+    size_t n = strlen(d->ws.rotated_token);
+    if(n >= cap) return -1;
+    for(size_t i = 0; i < n; i++){
+        unsigned char c = (unsigned char)d->ws.rotated_token[i];
+        if(c <= 0x20 || c > 0x7e){
+            memset(d->ws.rotated_token, 0, sizeof d->ws.rotated_token);
+            return -1;
+        }
+    }
+    memcpy(out, d->ws.rotated_token, n + 1);
+    memset(d->ws.rotated_token, 0, sizeof d->ws.rotated_token);
+    return 1;
+}
+
+int discord_take_qos_token(discord_t *d, char *out, size_t cap){
+    if(!d || !out || cap == 0 || !d->ws.qos_token[0]) return 0;
+    size_t n = strlen(d->ws.qos_token);
+    if(n >= cap) return -1;
+    for(size_t i = 0; i < n; i++){
+        unsigned char c = (unsigned char)d->ws.qos_token[i];
+        if(c <= 0x20 || c > 0x7e){
+            memset(d->ws.qos_token, 0, sizeof d->ws.qos_token);
+            return -1;
+        }
+    }
+    memcpy(out, d->ws.qos_token, n + 1);
+    memset(d->ws.qos_token, 0, sizeof d->ws.qos_token);
+    return 1;
+}
+
+void discord_clear_credentials(discord_t *d){
+    if(!d) return;
+    memset(d->token, 0, sizeof d->token);
+    memset(d->qos_token, 0, sizeof d->qos_token);
+    memset(d->ws.rotated_token, 0, sizeof d->ws.rotated_token);
+    memset(d->ws.qos_token, 0, sizeof d->ws.qos_token);
+    memset(d->ws.env.auth_token, 0, sizeof d->ws.env.auth_token);
+    memset(d->ws.env.qos_token, 0, sizeof d->ws.env.qos_token);
+    d->ws.env.have_auth_token = 0;
+    d->ws.env.have_qos_token = 0;
+}
+
+int discord_set_presence(discord_t *d, const char *state, const char *name,
+                         const char *application_id, int64_t started_epoch){
+    return discord_set_presence_ex(d, state, name, NULL, NULL, NULL,
+                                    NULL, application_id, NULL, NULL,
+                                    NULL, started_epoch);
+}
+
+static int presence_window_open(const discord_t *d, int64_t now){
+    int recent = 0;
+    for(size_t i = 0; i < sizeof d->presence_sent_at / sizeof d->presence_sent_at[0]; i++){
+        int64_t sent = d->presence_sent_at[i];
+        if(sent > 0 && (now < sent || now - sent < 20)) recent++;
+    }
+    return recent < 5;
+}
+
+static void presence_mark_sent(discord_t *d, int64_t now){
+    d->presence_sent_at[d->presence_next] = now;
+    d->presence_next = (d->presence_next + 1u) %
+        (unsigned)(sizeof d->presence_sent_at / sizeof d->presence_sent_at[0]);
+}
+
+static int presence_send(discord_t *d, const char *json, size_t len){
+    if(!presence_window_open(d, orbis_mono_s())){
+        if(len + 1 > sizeof d->pending_presence) return -1;
+        memcpy(d->pending_presence, json, len);
+        d->pending_presence[len] = 0;
+        d->pending_presence_len = len;
+        log_dbg("presence coalesced by gateway rate limit");
+        return 0;
+    }
+    if(ws_send_text(&d->ws, json, len) < 0) return -1;
+    presence_mark_sent(d, orbis_mono_s());
+    return 0;
+}
+
+static int presence_flush(discord_t *d){
+    if(!d->pending_presence_len || !presence_window_open(d, orbis_mono_s())) return 0;
+    if(ws_send_text(&d->ws, d->pending_presence, d->pending_presence_len) < 0) return -1;
+    presence_mark_sent(d, orbis_mono_s());
+    memset(d->pending_presence, 0, d->pending_presence_len);
+    d->pending_presence_len = 0;
+    return 0;
+}
+
+static int heartbeat_send(discord_t *d, int64_t now){
+    jl_val_t *hb = discord_build_heartbeat(d->seq);
+    char *payload = hb ? jl_stringify(hb) : NULL;
+    jl_free(hb);
+    if(!payload || ws_send_text(&d->ws, payload, strlen(payload)) < 0){
+        free(payload);
+        return -1;
+    }
+    free(payload);
+    d->last_heartbeat = now;
+    if(!d->sent_hb) d->last_ack = now;
+    d->sent_hb = 1;
+    return 0;
+}
+
+/* Lowercase titleId into an asset-key buffer. Returns key length. */
+static size_t asset_key(const char *title_id, char *key, size_t cap){
+    size_t ki = 0;
+    if(!title_id || !key || cap == 0) return 0;
+    for(size_t i = 0; title_id[i] && ki < cap-1; i++){
+        char c = title_id[i];
+        if(c>='A'&&c<='Z') c += 'a'-'A';
+        if((c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_') key[ki++]=c;
+    }
+    key[ki] = 0;
+    return ki;
+}
+
+/* Test seam: pure activity-JSON builder (no sockets). token may be ""
+ * to skip the mp: proxy (deterministic offline tests). NULL on OOM. */
+jl_val_t *discord_build_activity(const char *state, const char *name,
+                          const char *details,
+                          const char *asset_idle, const char *asset_playing,
+                          const char *title_id, const char *application_id,
+                          const char *art_base_url, const char *art_url,
+                          const char *small_art_url,
+                          int64_t started_epoch, const char *token){
+    if(!name) return NULL;
+    jl_val_t *act=jl_new_object();
+    if(!act) return NULL;
+    jl_obj_set(act,"name",jl_new_string(name?name:""));
+    {
+        /* Media apps (Netflix/YouTube/...) post Watching/Listening. */
+        int atype = 0;
+        if(title_id && title_id[0]){
+            atype = detect_media_type(title_id);
+            if(atype != 0 && atype != 2 && atype != 3) atype = 0;
+        }
+        jl_obj_set(act,"type",jl_new_int(atype)); /* 0 Playing */
+    }
+    /* Second visible line. Never the raw title ID: that renders as noise
+     * under the name, and twice when the name itself fell back to the ID.
+     * Callers pass a short human phrase (what you are doing); the
+     * firmware version belongs in `state`, alongside the timer. */
+    if(details&&details[0]) jl_obj_set(act,"details",jl_new_string(details));
+    if(state&&state[0]) jl_obj_set(act,"state",jl_new_string(state));
+    /* details intentionally mirrors the human-readable name, never the raw
+     * title ID: sending the ID here renders it as a second line under the
+     * game name (and twice when the name itself fell back to the ID).
+     * title_id is still used for media-type lookup and artwork below. */
+    if(started_epoch>0){
+        jl_val_t *ts=jl_new_object();
+        if(!ts){ jl_free(act); return NULL; }
+        if(started_epoch > 0 && started_epoch < 100000000000LL)
+            jl_obj_set(ts,"start",jl_new_int(started_epoch*1000LL)); /* integer ms epoch */
+        jl_obj_set(act,"timestamps",ts);
+    }
+    if(application_id&&application_id[0])
+        jl_obj_set(act,"application_id",jl_new_string(application_id));
+    else if(title_id&&title_id[0]&&!(art_base_url&&art_base_url[0])&&!(art_url&&art_url[0])){
+        /* No artwork will appear without a shared app or art URL pack:
+         * say so once instead of failing silently every update. */
+        static int art_warned = 0;
+        if(!art_warned){ art_warned = 1;
+            log_msg("art: no application_id or art_base_url; presence sends without artwork"); }
+    }
+    /* Artwork (verified on hardware 2026-09-23): raw https URLs and
+     * dangling keys drop the whole activity. Two working forms, tried in
+     * order: (1) mp: proxy resolved via external-assets for the URL we
+     * have (Sony CDN or art_base_url pack); (2) uploaded asset key. */
+    /* "settings" is idle artwork too: Settings shows the same large
+     * image as home. Without this the branch fell through and the
+     * activity was sent with no assets at all. */
+    int idle_art = title_id && title_id[0] &&
+                   (!strcmp(title_id,"home") || !strcmp(title_id,"settings") ||
+                    !strcmp(title_id,"browser"));
+    if(idle_art && application_id && application_id[0]){
+        /* Idle tile: PlayStation logo. home_art (arrives as art_url):
+         * http(s) URL -> mp: proxy; bare value -> uploaded asset key
+         * used as-is; empty -> <art_base_url>home.png when the pack
+         * carries it. A URL that fails mp: sends NO assets (never a
+         * dangling key: those drop the whole activity). */
+        const char *hsrc = (art_url&&art_url[0]) ? art_url : NULL;
+        if(hsrc && strchr(hsrc, '"')) hsrc = NULL; /* config garbage fails
+            soft to the pack default, never a broken JSON POST */
+        if(hsrc && strncmp(hsrc, "http", 4) != 0){
+            for(const char *q = hsrc; *q; q++){
+                char ch = *q;
+                if(!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')){
+                    hsrc = NULL; /* not a valid asset key: pack default */
+                    break;
+                }
+            }
+        }
+        /* fork: no logo -- the <art_base_url>home.png fallback is gone, so an
+         * empty home_art/large_art/asset_idle sends the idle presence with no image. */
+        char hmp[512] = "";
+        /* Prefer the configured idle asset key: already uploaded to the
+         * Discord app, so it costs no external-assets round trip and
+         * works with no network. art_url stays the fallback so an
+         * operator who prefers a URL is not overridden. */
+        const char *himg = NULL;
+        if(asset_idle && asset_idle[0]){
+            himg = asset_idle;
+        } else {
+        if(hsrc && !strncmp(hsrc,"http",4)){
+            if(token && token[0] && art_resolve_mp(application_id, token, hsrc, hmp, sizeof hmp))
+                himg = hmp;
+        } else if(hsrc){
+            himg = hsrc; /* operator-supplied uploaded key: trusted */
+        }
+        }
+        if(himg){
+            jl_val_t *as=jl_new_object();
+            if(as){
+                jl_obj_set(as,"large_image",jl_new_string(himg));
+                jl_obj_set(as,"large_text",jl_new_string(name?name:""));
+                jl_obj_set(act,"assets",as);
+            }
+        }
+    } else if(title_id&&title_id[0]&&application_id&&application_id[0]){
+        char mp[512] = "";
+        const char *src_url = (art_url&&art_url[0]) ? art_url : NULL;
+        char pack_url[320] = "";
+        if(!src_url && art_base_url&&art_base_url[0]&&title_id){
+            char key[16];
+            if(asset_key(title_id, key, sizeof key) >= 4){
+                int n=snprintf(pack_url,sizeof pack_url,"%s%s.png",art_base_url,key);
+                if(n>0 && (size_t)n<sizeof pack_url) src_url = pack_url;
+            }
+        }
+        if(src_url && token && token[0] &&
+           art_resolve_mp(application_id, token, src_url, mp, sizeof mp)){
+            jl_val_t *as=jl_new_object();
+            if(as){
+                jl_obj_set(as,"large_image",jl_new_string(mp));
+                /* hover carries the raw title ID (PC-tool pattern):
+                 * visible lines stay clean, ID one hover away. */
+                jl_obj_set(as,"large_text",jl_new_string(title_id));
+                jl_obj_set(act,"assets",as);
+            }
+        } else {
+            char key[16];
+            if(asset_key(title_id, key, sizeof key) >= 4){
+                jl_val_t *as=jl_new_object();
+                if(as){
+                    jl_obj_set(as,"large_image",jl_new_string(key));
+                    jl_obj_set(as,"large_text",jl_new_string(title_id));
+                    jl_obj_set(act,"assets",as);
+                }
+            }
+        }
+    }
+    /* System badge (PC-tool pattern): small corner tile, e.g. the
+     * PlayStation logo next to game art. mp: URLs resolve through the
+     * disk-cached proxy; anything unresolvable is omitted, never sent
+     * raw (bad small images drop the whole activity). */
+    int playing_art = title_id && title_id[0] &&
+                       strcmp(title_id,"home") != 0 &&
+                       strcmp(title_id,"settings") != 0 &&
+                       strcmp(title_id,"browser") != 0;
+    if(asset_playing && asset_playing[0] && playing_art){
+        jl_val_t *as = jl_obj_get(act, "assets");
+        if(!as || as->type != JL_OBJECT){
+            as = jl_new_object();
+            if(as) jl_obj_set(act, "assets", as);
+        }
+        if(as && as->type == JL_OBJECT){
+            jl_obj_set(as, "small_image", jl_new_string(asset_playing));
+            jl_obj_set(as, "small_text", jl_new_string("PlayStation 4"));
+        }
+    } else if(small_art_url && small_art_url[0]){
+        char smp[512] = "";
+        const char *simg = NULL;
+        if(!strncmp(small_art_url, "mp:", 3)){
+            simg = small_art_url;
+        } else if(!strncmp(small_art_url, "http", 4) && token && token[0] &&
+                  art_resolve_mp(application_id, token, small_art_url, smp, sizeof smp)){
+            simg = smp;
+        }
+        if(simg){
+            jl_val_t *as = jl_obj_get(act, "assets");
+            if(as && as->type == JL_OBJECT){
+                jl_obj_set(as, "small_image", jl_new_string(simg));
+                jl_obj_set(as, "small_text", jl_new_string("PlayStation 4"));
+            }
+        }
+    }
+    return act;
+}
+
+int discord_set_presence_ex(discord_t *d, const char *state, const char *name,
+                          const char *details,
+                          const char *asset_idle, const char *asset_playing,
+                         const char *title_id, const char *application_id,
+                         const char *art_base_url, const char *art_url,
+                         const char *small_art_url,
+                         int64_t started_epoch){
+    if(!d || !d->connected || !name) return -1;
+    jl_val_t *act = discord_build_activity(state, name, details,
+        asset_idle, asset_playing, title_id,
+        application_id, art_base_url, art_url, small_art_url, started_epoch, d->token);
+    if(!act) return -1;
+    jl_val_t *dd=jl_new_object();
+    jl_obj_set(dd,"activities",jl_new_array());
+    jl_arr_push(jl_obj_get(dd,"activities"), act);
+    jl_obj_set(dd,"status",jl_new_string("online"));
+    /* NOT idle: Gateway expects null, not 0. Sending 0 asserts
+     * "idle since 1970" and can wedge the client timer at 0:00. */
+    jl_obj_set(dd,"since",jl_new_null());
+    jl_obj_set(dd,"afk",jl_new_bool(0));
+    jl_val_t *root=jl_new_object();
+    if(!root){ jl_free(dd); return -1; }
+    jl_obj_set(root,"op",jl_new_int(3));
+    jl_obj_set(root,"d",dd);
+    char *s=jl_stringify(root); jl_free(root);
+    if(!s) return -1;
+    int r=presence_send(d,s,strlen(s)); free(s);
+    return r;
+}
+
+int discord_clear_presence(discord_t *d){
+    if(!d || !d->connected) return -1;
+    jl_val_t *dd=jl_new_object();
+    jl_obj_set(dd,"activities",jl_new_array());
+    jl_obj_set(dd,"status",jl_new_string("online")); /* stay visible, just idle */
+    jl_obj_set(dd,"since",jl_new_null());
+    jl_obj_set(dd,"afk",jl_new_bool(0));
+    jl_val_t *root=jl_new_object();
+    if(!root){ jl_free(dd); return -1; }
+    jl_obj_set(root,"op",jl_new_int(3));
+    jl_obj_set(root,"d",dd);
+    char *s=jl_stringify(root); jl_free(root);
+    if(!s) return -1;
+    int r=presence_send(d,s,strlen(s)); free(s);
+    return r;
+}
+
+int discord_tick(discord_t *d){
+    if(!d || !d->connected) return -1;
+    int64_t now=orbis_mono_s();
+    long hb_s=(long)(d->hb_interval_ms/1000); if(hb_s<5)hb_s=5;
+    /* gateway must ack heartbeats; 2 missed intervals means it's gone */
+    if(d->sent_hb && now-d->last_ack > hb_s*2+15){
+        log_msg("heartbeat timeout (no ack)");
+        d->connected=0;
+        return -1;
+    }
+    /* fire slightly EARLY (tick cadence adds up to ~1s of jitter) so we are
+     * always inside the gateway's heartbeat window */
+    long fire = hb_s>3 ? hb_s-2 : hb_s;
+    if(now-d->last_heartbeat >= fire){
+        if(heartbeat_send(d, now) < 0){
+            log_msg("heartbeat send failed; reconnecting");
+            d->connected=0;
+            return -1;
+        }
+    }
+    if(presence_flush(d) < 0){
+        log_msg("queued presence send failed; reconnecting");
+        d->connected=0;
+        return -1;
+    }
+    /* drain pending server frames (non-blocking); 2048 covers the dispatch
+     * envelope ({"t":..,"s":N,..) with margin — big payloads are consumed
+     * inside ws_recv_frame regardless of this cap */
+    char buf[2048]; int op=0,fin=0;
+    for(int i=0;i<32;i++){
+        op=0;
+        fin=0;
+        int nr=ws_recv_frame(&d->ws,buf,sizeof buf,&op,&fin);
+        if(nr==-3){ log_msg("skipped oversized frame"); continue; }
+        if(nr<0){ d->connected=0; return -1; }
+        if(op==8){ /* WS CLOSE: payload starts with a 2-byte big-endian code */
+            if(!fin){ log_msg("fragmented close; reconnecting"); d->connected=0; return -1; }
+            if(nr==0){ log_msg("gateway closed without a status code"); d->connected=0; return -1; }
+            unsigned code = 0;
+            if(!close_status_payload(buf, nr, &code)){
+                log_msg("malformed close payload (len %d); reconnecting", nr);
+                d->connected=0; return -1;
+            }
+            log_msg("gateway closed: code=%u",code);
+            d->connected=0;
+            return code==4004 ? -2 : -1;
+        }
+        if(op==9){
+            if(ws_pong(&d->ws, (const unsigned char *)buf, (size_t)nr) < 0){
+                log_msg("websocket PONG send failed; reconnecting");
+                d->connected=0;
+                return -1;
+            }
+            continue;
+        }
+        if(nr==0) break;
+        if(op!=1 && op!=0) continue;
+        if(!valid_gateway_json(buf)){
+            log_msg("malformed gateway JSON; ignoring frame");
+            continue;
+        }
+        switch(gw_op(buf, (size_t)nr)){
+        case 0: /* DISPATCH: only the sequence matters to us */
+            gw_seq(d, buf, (size_t)nr);
+            break;
+        case 7: /* RECONNECT requested */
+            log_msg("gateway: reconnect requested");
+            d->connected=0;
+            return -1;
+        case 9: /* INVALID_SESSION: session dead, fresh IDENTIFY needed.
+                   * Distinct code so the caller retries promptly instead of
+                   * doubling into a long backoff. */
+            log_msg("gateway: invalid session");
+            d->connected=0;
+            return -3;
+        case 11:
+            d->last_ack=now;
+            break;
+        case 1:
+            if(heartbeat_send(d, now) < 0){
+                log_msg("requested heartbeat send failed; reconnecting");
+                d->connected=0;
+                return -1;
+            }
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,112 @@
+name: ci
+on: [push, pull_request]
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: host unit tests
+        run: make -C tests clean && make -C tests test
+      - name: ASan/UBSan
+        run: make -C tests asan
+      - name: e2e contracts
+        run: python3 tests/e2e_consumer.py
+        env:
+          DISHEN_STRICT_SECRETS: "1"
+  sdk-payload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The release ZIP (v0.9) predates the SDK's 13.52 offsets, and the SDK's
+      # crt/patch.c makes _start() terminate before main() for unlisted
+      # firmware -- so a ZIP-built payload dies silently on 13.52. Build from
+      # git instead. Recipe from drakmor/nanoDNS's ps4 workflow, which ships a
+      # working 13.52 payload over the same elfldr path.
+      - name: checkout ps4-payload-sdk
+        uses: actions/checkout@v5
+        with:
+          repository: ps4-payload-dev/sdk
+          path: sdk
+          fetch-depth: 0 # a raw SHA is not a branch/tag; checkout the repo then pin it
+      - name: pin ps4-payload-sdk
+        run: git -C sdk checkout 573b4a0 # Add 14.00 offsets; includes 959e4ed "Add 13.52 offsets"
+      - name: install llvm
+        run: sudo apt-get update -qq && sudo apt-get install -qy clang-18 lld-18 llvm-18
+      - name: build SDK from source
+        run: |
+          make -C sdk DESTDIR="$HOME/ps4-payload-sdk" clean install
+      - name: gate SDK firmware support
+        # __patch_init() errors for firmware absent from this table, and
+        # crt/crt.c turns that into payload_terminate() before main().
+        run: |
+          grep -q "case 0x1352:" sdk/crt/patch.c || {
+            echo "FAIL: SDK lacks 13.52 offsets; payload cannot boot on 13.52"; exit 1; }
+          echo "SDK has 13.52 offsets"
+      - name: build SDK daemon payload
+        run: |
+          export PS4_PAYLOAD_SDK="$HOME/ps4-payload-sdk"
+          export PS4_SDK_SRC="$GITHUB_WORKSPACE/sdk"
+          ./scripts/build_sdk.sh
+      - name: gate daemon-world linkage only
+        run: |
+          export LLVM_READELF="$(command -v llvm-readelf-18 || command -v llvm-readelf)"
+          NEEDED=$("$LLVM_READELF" -d build-sdk/dishen_sdk.elf | grep NEEDED | sed 's/.*\[//;s/\]//')
+          echo "$NEEDED"
+          echo "$NEEDED" | grep -q libkernel_web.sprx || { echo "missing libkernel_web"; exit 1; }
+          echo "$NEEDED" | grep -q libSceLibcInternal.sprx || { echo "missing libSceLibcInternal"; exit 1; }
+          echo "$NEEDED" | grep -q libSceNet.sprx || { echo "missing libSceNet"; exit 1; }
+          # Foreground detection is sceSystemServiceGetAppIdOfBigApp +
+          # sceLncUtilGetAppTitleId. Without this module the payload cannot
+          # start at all, so assert it rather than trusting the link line.
+          echo "$NEEDED" | grep -q libSceSystemService.sprx || { echo "missing libSceSystemService (foreground detection)"; exit 1; }
+          if echo "$NEEDED" | grep -q 'libkernel\.so'; then echo "FORBIDDEN: app-world libkernel.so"; exit 1; fi
+          echo "linkage OK"
+      - name: upload test-build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Dis-HEN-test-build
+          path: build-sdk/dishen_sdk.elf
+          if-no-files-found: error
+  notify:
+    # Post-push Discord ping via webhook. The webhook URL lives in the
+    # DISCORD_WEBHOOK_URL repo secret (never in the tree); forks without
+    # the secret skip silently instead of failing.
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    needs: [host, sdk-payload]
+    steps:
+      - name: notify discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "no DISCORD_WEBHOOK_URL secret; skipping notify"
+            exit 0
+          fi
+          python3 - "$DISCORD_WEBHOOK_URL" <<'EOF'
+          import json, os, urllib.error, urllib.request
+          url = os.environ["DISCORD_WEBHOOK_URL"]
+          msg = os.environ.get("COMMIT_MSG", "")[:1500]
+          content = (
+              f"🚀 **Dis-HEN** new commit on `{os.environ['GITHUB_REF_NAME']}` "
+              f"by {os.environ['GITHUB_ACTOR']}: {os.environ['GITHUB_SHA'][:7]}\n"
+              f"```\n{msg}\n```\n"
+              f"<https://github.com/{os.environ['GITHUB_REPOSITORY']}/commit/{os.environ['GITHUB_SHA']}>"
+          )
+          req = urllib.request.Request(
+              url, data=json.dumps({"content": content}).encode(),
+              headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  response.read()
+          except urllib.error.HTTPError as error:
+              print(f"::warning::Discord notification failed with HTTP {error.code}; CI remains green. Check DISCORD_WEBHOOK_URL.")
+          except urllib.error.URLError:
+              print("::warning::Discord notification failed because the endpoint could not be reached; CI remains green.")
+          else:
+              print("discord notified")
+          EOF

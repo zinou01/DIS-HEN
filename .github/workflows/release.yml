@@ -63,7 +63,7 @@ jobs:
           export PS4_SDK_SRC="$GITHUB_WORKSPACE/sdk"
           make installer
           cp build-sdk/dishen_sdk.elf Dis-HEN.elf
-          cp output/Dis-HEN-1.1.pkg Dis-HEN-setup-1.1.pkg
+          cp output/DIS-HEN-1.1.pkg Dis-HEN-setup-1.1.pkg
           test -s Dis-HEN.elf
           test -s Dis-HEN-setup-1.1.pkg
       - name: publish release assets

@@ -17,6 +17,12 @@
  * 1 = dark, 0 = light). `cap` must be at least QR_MAX_MODULES.
  * Returns the side length in modules (21..57), or 0 when the text does not fit
  * or the arguments are unusable. The mask is chosen by penalty score. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 int qr_encode(const char *text, uint8_t *modules, size_t cap);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

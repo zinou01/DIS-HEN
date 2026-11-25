@@ -1,41 +1,55 @@
 name: release
+
 on:
   push:
     tags:
       - 'v*'
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
+
     steps:
       - uses: actions/checkout@v5
+
       - name: checkout ps4-payload-sdk
         uses: actions/checkout@v5
         with:
           repository: ps4-payload-dev/sdk
           path: sdk
-          fetch-depth: 0 # a raw SHA is not a branch/tag; checkout the repo then pin it
+          fetch-depth: 0
+
       - name: pin ps4-payload-sdk
-        run: git -C sdk checkout 573b4a0 # Add 14.00 offsets; includes 959e4ed "Add 13.52 offsets"
+        run: git -C sdk checkout 573b4a0
+
       - name: install llvm
         run: sudo apt-get update -qq && sudo apt-get install -qy clang-18 lld-18 llvm-18
+
       - name: build SDK from source
         run: |
           make -C sdk DESTDIR="$HOME/ps4-payload-sdk" clean install
+
       - name: gate SDK firmware support
         run: |
           grep -q "case 0x1352:" sdk/crt/patch.c || {
-            echo "FAIL: SDK lacks 13.52 offsets; payload cannot boot on 13.52"; exit 1; }
+            echo "FAIL: SDK lacks 13.52 offsets; payload cannot boot on 13.52"
+            exit 1
+          }
           echo "SDK has 13.52 offsets"
+
       - name: build SDK daemon payload
         run: |
           export PS4_PAYLOAD_SDK="$HOME/ps4-payload-sdk"
           export PS4_SDK_SRC="$GITHUB_WORKSPACE/sdk"
           ./scripts/build_sdk.sh
+
       - name: gate daemon-world linkage only
         run: |
           export LLVM_READELF="$(command -v llvm-readelf-18 || command -v llvm-readelf)"
@@ -45,8 +59,12 @@ jobs:
           echo "$NEEDED" | grep -q libSceLibcInternal.sprx || { echo "missing libSceLibcInternal"; exit 1; }
           echo "$NEEDED" | grep -q libSceNet.sprx || { echo "missing libSceNet"; exit 1; }
           echo "$NEEDED" | grep -q libSceSystemService.sprx || { echo "missing libSceSystemService (foreground detection)"; exit 1; }
-          if echo "$NEEDED" | grep -q 'libkernel\.so'; then echo "FORBIDDEN: app-world libkernel.so"; exit 1; fi
+          if echo "$NEEDED" | grep -q 'libkernel\.so'; then
+            echo "FORBIDDEN: app-world libkernel.so"
+            exit 1
+          fi
           echo "linkage OK"
+
       - name: install OpenOrbis packaging toolchain
         run: |
           python3 -m pip install --user pillow
@@ -56,16 +74,34 @@ jobs:
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
             | tar -xz --strip-components=2 -C "$HOME/OpenOrbis-PS4-Toolchain"
           ./scripts/setup-pkgtool-openssl.sh
+
       - name: build Setup PKG
         run: |
           export OO_PS4_TOOLCHAIN="$HOME/OpenOrbis-PS4-Toolchain"
           export PS4_PAYLOAD_SDK="$HOME/ps4-payload-sdk"
           export PS4_SDK_SRC="$GITHUB_WORKSPACE/sdk"
+
           make installer
-          cp build-sdk/dishen_sdk.elf Dis-HEN.elf
-          cp output/DIS-HEN-1.1.pkg Dis-HEN-setup-1.1.pkg
+
+          echo "=== Check generated files ==="
+          pwd
+          find . -maxdepth 4 -type f \( -iname "*.pkg" -o -iname "*.elf" \) -print
+
+          echo "=== Verify PKG ==="
+          test -s output/DIS-HEN-1.1.pkg
+
+          echo "=== Verify payload ==="
+          test -s build-sdk/dishen_sdk.elf
+
+          cp -f build-sdk/dishen_sdk.elf Dis-HEN.elf
+          cp -f output/DIS-HEN-1.1.pkg Dis-HEN-setup-1.1.pkg
+
           test -s Dis-HEN.elf
           test -s Dis-HEN-setup-1.1.pkg
+
+          echo "=== Release files ready ==="
+          ls -lh Dis-HEN.elf Dis-HEN-setup-1.1.pkg
+
       - name: publish release assets
         uses: softprops/action-gh-release@v3
         with:

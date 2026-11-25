@@ -17,10 +17,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: checkout ps4-payload-sdk
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           repository: ps4-payload-dev/sdk
           path: sdk
